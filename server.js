@@ -14,7 +14,7 @@ const SESSION_DAYS = 30;
 
 // ---------------------------------------------------------------- banco
 fs.mkdirSync(DATA_DIR, { recursive: true });
-const EMPTY = { users: [], sessions: [], servers: [], members: [], channels: [], messages: [], roles: [], dms: [], dm_messages: [], uploads: [], friends: [] };
+const EMPTY = { users: [], sessions: [], servers: [], members: [], channels: [], messages: [], roles: [], dms: [], dm_messages: [], uploads: [], friends: [], blocks: [], reports: [] };
 let db;
 try {
   db = { ...JSON.parse(JSON.stringify(EMPTY)), ...JSON.parse(fs.readFileSync(DB_FILE, 'utf8')) };
@@ -79,7 +79,25 @@ function checkPassword(pw, stored) {
   return crypto.timingSafeEqual(crypto.scryptSync(pw, salt, 64), Buffer.from(hash, 'hex'));
 }
 
-const publicUser = (u) => u && ({ id: u.id, username: u.username || '', display_name: u.display_name, avatar_url: u.avatar_url || '', email: u.email });
+const publicUser = (u) => u && ({ id: u.id, username: u.username || '', display_name: u.display_name, avatar_url: u.avatar_url || '', email: u.email,
+  bio: u.bio || '', status_text: u.status_text || '', banner_url: u.banner_url || '', accent: u.accent || '', privacy: privacyOf(u),
+  two_factor: !!u.totp_secret, is_admin: isAdmin(u), badges: badgesOf(u), created_at: u.created_at });
+function privacyOf(u) { return { dms: u.privacy?.dms || 'servers', friend_requests: u.privacy?.friend_requests || 'everyone', show_bio: u.privacy?.show_bio !== false }; }
+// administradores da plataforma: e-mails em ADMIN_EMAILS, ou a primeira conta criada
+function isAdmin(u) {
+  if (!u) return false;
+  const list = String(process.env.ADMIN_EMAILS || '').toLowerCase().split(/[,;\s]+/).filter(Boolean);
+  if (list.length) return list.includes(u.email);
+  return db.users[0]?.id === u.id;
+}
+const FOUNDER_LIMIT = Number(process.env.FOUNDER_LIMIT || 100);
+function badgesOf(u) {
+  const out = [];
+  if (isAdmin(u)) out.push('equipe');
+  const idx = db.users.indexOf(u);
+  if (idx >= 0 && idx < FOUNDER_LIMIT) out.push('fundador');
+  return out;
+}
 // dados de outra pessoa (sem e-mail)
 const personOf = (u) => u && ({ id: u.id, username: u.username || '', display_name: u.display_name, avatar_url: u.avatar_url || '', online: socketsOf(u.id).length > 0 });
 const USERNAME_RE = /^[a-z0-9_.]{3,20}$/;
@@ -542,25 +560,41 @@ function parseCookies(header = '') {
   });
   return out;
 }
-function userFromCookie(header) {
+function sessionFromCookie(header) {
   const token = parseCookies(header)[COOKIE];
   if (!token) return null;
   const s = db.sessions.find((x) => x.token === token);
   if (!s || new Date(s.expires) < new Date()) return null;
-  return userById(s.user_id) || null;
+  return s;
+}
+function userFromCookie(header) {
+  const s = sessionFromCookie(header);
+  return s ? userById(s.user_id) || null : null;
+}
+function deviceLabel(ua = '') {
+  const os = /Android/i.test(ua) ? 'Android' : /iPhone|iPad/i.test(ua) ? 'iPhone/iPad' : /Windows/i.test(ua) ? 'Windows' : /Mac OS/i.test(ua) ? 'Mac' : /Linux/i.test(ua) ? 'Linux' : 'Dispositivo';
+  const br = /Edg\//.test(ua) ? 'Edge' : /OPR\//.test(ua) ? 'Opera' : /Chrome\//.test(ua) ? 'Chrome' : /Firefox\//.test(ua) ? 'Firefox' : /Safari\//.test(ua) ? 'Safari' : 'Navegador';
+  return `${br} · ${os}`;
 }
 function setSession(req, res, userId) {
   const token = crypto.randomBytes(32).toString('hex');
   const expires = new Date(Date.now() + SESSION_DAYS * 864e5);
-  db.sessions.push({ token, user_id: userId, expires: expires.toISOString() });
+  db.sessions.push({ token, sid: crypto.randomBytes(6).toString('hex'), user_id: userId, expires: expires.toISOString(),
+    created_at: now(), last_seen: now(), device: deviceLabel(String(req.headers['user-agent'] || '')), ip: String(req.ip || '').replace(/^::ffff:/, '') });
+  // limpa sessões vencidas
+  const t = new Date();
+  db.sessions = db.sessions.filter((x) => new Date(x.expires) > t);
   save();
   const secure = req.secure ? '; Secure' : '';
   res.setHeader('Set-Cookie', `${COOKIE}=${token}; HttpOnly; Path=/; SameSite=Lax; Expires=${expires.toUTCString()}${secure}`);
 }
 function auth(req, res, next) {
-  const u = userFromCookie(req.headers.cookie);
+  const s = sessionFromCookie(req.headers.cookie);
+  const u = s && userById(s.user_id);
   if (!u) return res.status(401).json({ error: 'Faça login para continuar.' });
-  req.user = u;
+  if (u.banned) return res.status(403).json({ error: 'Esta conta foi suspensa por violar as regras.' });
+  if (!s.last_seen || Date.now() - new Date(s.last_seen) > 5 * 60e3) { s.last_seen = now(); save(); }
+  req.user = u; req.session = s;
   next();
 }
 const bad = (res, msg, code = 400) => res.status(code).json({ error: msg });
@@ -587,10 +621,38 @@ app.post('/api/auth/register', (req, res) => {
   setSession(req, res, user.id);
   res.json(publicUser(user));
 });
+const loginTickets = new Map(); // ticket -> { user_id, exp }
+const loginFails = new Map();
 app.post('/api/auth/login', (req, res) => {
   const email = cleanStr(req.body.email, 120).toLowerCase();
+  const key = email + '|' + (req.ip || '');
+  const fails = (loginFails.get(key) || []).filter((t) => Date.now() - t < 10 * 60e3);
+  if (fails.length >= 8) return bad(res, 'Muitas tentativas. Espere alguns minutos e tente de novo.', 429);
   const user = db.users.find((u) => u.email === email);
-  if (!user || !checkPassword(String(req.body.password || ''), user.password)) return bad(res, 'E-mail ou senha incorretos.', 401);
+  if (!user || !checkPassword(String(req.body.password || ''), user.password)) {
+    fails.push(Date.now()); loginFails.set(key, fails);
+    return bad(res, user ? 'Senha incorreta.' : 'Não existe conta com esse e-mail. Confira ou clique em Cadastre-se.', 401);
+  }
+  loginFails.delete(key);
+  if (user.banned) return bad(res, 'Esta conta foi suspensa por violar as regras.', 403);
+  if (user.totp_secret) {
+    const ticket = crypto.randomBytes(18).toString('hex');
+    loginTickets.set(ticket, { user_id: user.id, exp: Date.now() + 5 * 60e3, tries: 0 });
+    return res.json({ need_2fa: true, ticket });
+  }
+  setSession(req, res, user.id);
+  res.json(publicUser(user));
+});
+app.post('/api/auth/2fa', (req, res) => {
+  const t = loginTickets.get(String(req.body.ticket || ''));
+  if (!t || t.exp < Date.now()) return bad(res, 'O tempo acabou. Faça login de novo.', 401);
+  const user = userById(t.user_id);
+  if (!user || !checkSecondFactor(user, req.body.code)) {
+    t.tries++; if (t.tries >= 5) loginTickets.delete(req.body.ticket);
+    return bad(res, 'Código incorreto.', 401);
+  }
+  loginTickets.delete(req.body.ticket);
+  save();
   setSession(req, res, user.id);
   res.json(publicUser(user));
 });
@@ -609,6 +671,21 @@ app.patch('/api/me', auth, (req, res) => {
     if (!USERNAME_RE.test(un)) return bad(res, 'Nome de usuário: 3 a 20 letras minúsculas, números, _ ou ponto.');
     if (usernameTaken(un, req.user.id)) return bad(res, 'Esse nome de usuário já está em uso.');
     req.user.username = un;
+  }
+  if (req.body.bio !== undefined) req.user.bio = cleanStr(req.body.bio, 190);
+  if (req.body.status_text !== undefined) req.user.status_text = cleanStr(req.body.status_text, 60);
+  if (req.body.accent !== undefined) req.user.accent = validColor(req.body.accent) ? req.body.accent : '';
+  if (req.body.banner_url !== undefined) {
+    if (!validImage(req.body.banner_url)) return bad(res, 'Capa inválida ou muito grande.');
+    req.user.banner_url = req.body.banner_url || '';
+  }
+  if (req.body.privacy && typeof req.body.privacy === 'object') {
+    const pv = req.body.privacy;
+    req.user.privacy = {
+      dms: ['servers', 'friends'].includes(pv.dms) ? pv.dms : privacyOf(req.user).dms,
+      friend_requests: ['everyone', 'servers', 'nobody'].includes(pv.friend_requests) ? pv.friend_requests : privacyOf(req.user).friend_requests,
+      show_bio: pv.show_bio !== undefined ? !!pv.show_bio : privacyOf(req.user).show_bio,
+    };
   }
   if (display_name !== undefined) {
     const n = cleanStr(display_name, 32);
@@ -630,7 +707,9 @@ app.post('/api/me/password', auth, (req, res) => {
   if (!checkPassword(String(current || ''), req.user.password)) return bad(res, 'Senha atual incorreta.');
   if (String(next || '').length < 6) return bad(res, 'A nova senha precisa ter pelo menos 6 caracteres.');
   req.user.password = hashPassword(String(next));
-  save();
+  const gone = db.sessions.filter((x) => x.user_id === req.user.id && x.token !== req.session.token);
+  db.sessions = db.sessions.filter((x) => !gone.includes(x));
+  save(); kickSessions(gone.map((x) => x.token));
   res.json({ ok: true });
 });
 
@@ -956,7 +1035,7 @@ app.delete('/api/channels/:cid', auth, (req, res) => {
 // ---- mensagens
 function messagePayload(m) {
   const u = userById(m.author_id);
-  return { ...m, author_name: u ? u.display_name : m.author_name, author_avatar: u ? u.avatar_url : '', author_color: topRole(m.server_id, m.author_id)?.color || '' };
+  return { ...m, author_name: u ? u.display_name : m.author_name, author_avatar: u ? u.avatar_url : '', author_color: topRole(m.server_id, m.author_id)?.color || '', author_badges: u ? badgesOf(u) : [] };
 }
 function emitToChannel(c, event, payload) {
   for (const sock of io.sockets.adapter.rooms.get(`server:${c.server_id}`) || []) {
@@ -1029,7 +1108,7 @@ function dmPayload(d, uid) {
 }
 function dmMessagePayload(m) {
   const u = userById(m.author_id);
-  return { ...m, author_name: u ? u.display_name : '?', author_avatar: u ? u.avatar_url : '' };
+  return { ...m, author_name: u ? u.display_name : '?', author_avatar: u ? u.avatar_url : '', author_badges: u ? badgesOf(u) : [] };
 }
 function requireDm(req, res) {
   const d = dmById(req.params.did);
@@ -1051,7 +1130,8 @@ app.post('/api/dms', auth, (req, res) => {
   if (!other || other.id === req.user.id) return bad(res, 'Pessoa não encontrada.', 404);
   let d = db.dms.find((x) => x.user_ids.includes(req.user.id) && x.user_ids.includes(other.id));
   if (!d) {
-    if (!areFriends(req.user.id, other.id) && !sharesServer(req.user.id, other.id)) return bad(res, 'Adicione essa pessoa como amiga para conversar.', 403);
+    if (blockedEither(req.user.id, other.id)) return bad(res, 'Não é possível conversar com essa pessoa.', 403);
+    if (!areFriends(req.user.id, other.id) && (privacyOf(other).dms === 'friends' || !sharesServer(req.user.id, other.id))) return bad(res, 'Essa pessoa só recebe mensagens de amigos. Mande um pedido de amizade.', 403);
     d = { id: id(), user_ids: [req.user.id, other.id], created_by: req.user.id, accepted: { [req.user.id]: true }, created_at: now(), last_at: now(), read: {} };
     db.dms.push(d); save();
   }
@@ -1070,6 +1150,8 @@ app.post('/api/dms/:did/messages', auth, (req, res) => {
   if (hits.length >= 5) return bad(res, 'Calma! Você está enviando mensagens rápido demais.', 429);
   hits.push(t); rate.set(req.user.id, hits);
   const content = String(req.body.content || '').trim().slice(0, 2000);
+  const otherId = d.user_ids.find((u) => u !== req.user.id);
+  if (blockedEither(req.user.id, otherId)) return bad(res, 'Você não pode mandar mensagens para essa pessoa.', 403);
   const attachments = takeAttachments(req, res); if (!attachments) return;
   if (!content && !attachments.length) return bad(res, 'Mensagem vazia.');
   const m = { id: id(), dm_id: d.id, author_id: req.user.id, content, attachments, created_at: now() };
@@ -1112,6 +1194,7 @@ app.delete('/api/dms/:did', auth, (req, res) => {
   db.dm_messages = db.dm_messages.filter((m) => m.dm_id !== d.id);
   db.dms = db.dms.filter((x) => x.id !== d.id);
   save();
+  for (const [, sk] of io.sockets.sockets) if (sk.data.voice === `dm:${d.id}`) leaveVoice(sk);
   d.user_ids.forEach((u) => io.to(`user:${u}`).emit('dm:removed', { id: d.id }));
   res.json({ ok: true });
 });
@@ -1163,6 +1246,9 @@ app.post('/api/friends', auth, (req, res) => {
   hits.push(t); frRate.set(me, hits);
   let f = friendRow(me, other.id);
   if (f?.status === 'accepted') return bad(res, `Você e ${other.display_name} já são amigos.`);
+  if (blockedEither(me, other.id)) return bad(res, 'Não foi possível mandar o pedido para essa pessoa.', 403);
+  const fr = privacyOf(other).friend_requests;
+  if (!(f && f.to === me) && (fr === 'nobody' || (fr === 'servers' && !sharesServer(me, other.id)))) return bad(res, 'Essa pessoa não está aceitando pedidos de amizade.', 403);
   if (f && f.from === me) return bad(res, 'Você já mandou um pedido para essa pessoa.');
   if (f && f.to === me) { acceptFriend(f); save(); notifyFriends(me, other.id); return res.json({ ok: true, accepted: true, user: personOf(other) }); }
   f = { id: id(), key: pairKey(me, other.id), from: me, to: other.id, status: 'pending', message, created_at: now() };
@@ -1187,6 +1273,176 @@ app.delete('/api/friends/:fid', auth, (req, res) => {
   res.json({ ok: true });
 });
 
+// ---- segurança: sessões, 2 etapas, bloqueios, denúncias
+const B32 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+function base32(buf) { let bits = 0, val = 0, out = ''; for (const b of buf) { val = (val << 8) | b; bits += 8; while (bits >= 5) { out += B32[(val >>> (bits - 5)) & 31]; bits -= 5; } } if (bits) out += B32[(val << (5 - bits)) & 31]; return out; }
+function unbase32(str) { let bits = 0, val = 0; const out = []; for (const c of str.replace(/=+$/, '').toUpperCase()) { const i = B32.indexOf(c); if (i < 0) continue; val = (val << 5) | i; bits += 5; if (bits >= 8) { out.push((val >>> (bits - 8)) & 255); bits -= 8; } } return Buffer.from(out); }
+function totp(secret, step) {
+  const msg = Buffer.alloc(8); msg.writeBigUInt64BE(BigInt(step));
+  const h = crypto.createHmac('sha1', unbase32(secret)).update(msg).digest();
+  const o = h[h.length - 1] & 15;
+  return String(((h.readUInt32BE(o) & 0x7fffffff) % 1e6)).padStart(6, '0');
+}
+function checkTotp(secret, code) {
+  const c = String(code || '').replace(/\s/g, '');
+  if (!/^\d{6}$/.test(c)) return false;
+  const step = Math.floor(Date.now() / 30000);
+  return [-1, 0, 1].some((d) => crypto.timingSafeEqual(Buffer.from(totp(secret, step + d)), Buffer.from(c)));
+}
+const hashCode = (c) => crypto.createHash('sha256').update(String(c).toLowerCase().replace(/[^a-z0-9]/g, '')).digest('hex');
+function checkSecondFactor(user, code) {
+  if (checkTotp(user.totp_secret, code)) return true;
+  const h = hashCode(code || '');
+  const i = (user.backup_codes || []).indexOf(h);
+  if (i >= 0) { user.backup_codes.splice(i, 1); return true; }
+  return false;
+}
+app.get('/api/sessions', auth, (req, res) => {
+  const t = new Date();
+  res.json(db.sessions.filter((x) => x.user_id === req.user.id && new Date(x.expires) > t).map((x) => ({
+    sid: x.sid || x.token.slice(0, 12), device: x.device || 'Dispositivo antigo', ip: x.ip || '', created_at: x.created_at || '', last_seen: x.last_seen || '',
+    current: x.token === req.session.token,
+  })).sort((a, b) => (b.current - a.current) || (b.last_seen > a.last_seen ? 1 : -1)));
+});
+function kickSessions(tokens) {
+  for (const [, sk] of io.sockets.sockets) if (tokens.includes(sk.data.token)) { sk.emit('session:ended'); sk.disconnect(true); }
+}
+app.delete('/api/sessions/:sid', auth, (req, res) => {
+  const gone = db.sessions.filter((x) => x.user_id === req.user.id && (x.sid || x.token.slice(0, 12)) === req.params.sid && x.token !== req.session.token);
+  db.sessions = db.sessions.filter((x) => !gone.includes(x));
+  save(); kickSessions(gone.map((x) => x.token));
+  res.json({ ok: true, removed: gone.length });
+});
+app.post('/api/sessions/logout-others', auth, (req, res) => {
+  const gone = db.sessions.filter((x) => x.user_id === req.user.id && x.token !== req.session.token);
+  db.sessions = db.sessions.filter((x) => !gone.includes(x));
+  save(); kickSessions(gone.map((x) => x.token));
+  res.json({ ok: true, removed: gone.length });
+});
+// troca de senha encerra as outras sessões
+app.post('/api/2fa/setup', auth, async (req, res) => {
+  if (req.user.totp_secret) return bad(res, 'A verificação em duas etapas já está ligada.');
+  const secret = base32(crypto.randomBytes(20));
+  req.user.totp_pending = secret; save();
+  const label = encodeURIComponent(`Lumix:${req.user.username || req.user.email}`);
+  const uri = `otpauth://totp/${label}?secret=${secret}&issuer=Lumix&digits=6&period=30`;
+  let qr = '';
+  try { qr = await require('qrcode').toString(uri, { type: 'svg', margin: 1, color: { dark: '#000000', light: '#ffffff' } }); } catch { /* sem qr */ }
+  res.json({ secret, uri, qr });
+});
+app.post('/api/2fa/enable', auth, (req, res) => {
+  const sec = req.user.totp_pending;
+  if (!sec) return bad(res, 'Comece a configuração de novo.');
+  if (!checkTotp(sec, req.body.code)) return bad(res, 'Código incorreto. Confira o relógio do celular e tente de novo.');
+  req.user.totp_secret = sec; delete req.user.totp_pending;
+  const codes = Array.from({ length: 8 }, () => crypto.randomBytes(4).toString('hex').replace(/(.{4})/, '$1-'));
+  req.user.backup_codes = codes.map(hashCode);
+  save();
+  res.json({ ok: true, backup_codes: codes });
+});
+app.post('/api/2fa/disable', auth, (req, res) => {
+  if (!req.user.totp_secret) return res.json({ ok: true });
+  if (!checkPassword(String(req.body.password || ''), req.user.password)) return bad(res, 'Senha incorreta.');
+  if (!checkSecondFactor(req.user, req.body.code)) return bad(res, 'Código incorreto.');
+  delete req.user.totp_secret; delete req.user.backup_codes;
+  save();
+  res.json({ ok: true });
+});
+
+const isBlocked = (by, who) => db.blocks.some((b) => b.blocker === by && b.blocked === who);
+const blockedEither = (a, b) => isBlocked(a, b) || isBlocked(b, a);
+app.get('/api/blocks', auth, (req, res) => {
+  res.json(db.blocks.filter((b) => b.blocker === req.user.id).map((b) => ({ ...personOf(userById(b.blocked)), blocked_at: b.created_at })).filter((x) => x.id));
+});
+app.post('/api/blocks', auth, (req, res) => {
+  const other = userById(String(req.body.user_id || ''));
+  if (!other || other.id === req.user.id) return bad(res, 'Pessoa não encontrada.', 404);
+  if (!isBlocked(req.user.id, other.id)) db.blocks.push({ blocker: req.user.id, blocked: other.id, created_at: now() });
+  // bloquear desfaz amizade e pedidos
+  db.friends = db.friends.filter((f) => f.key !== pairKey(req.user.id, other.id));
+  save();
+  for (const [, sk] of io.sockets.sockets) {
+    const v = sk.data.voice;
+    const d = v && dmOfKey(v);
+    if (d && d.user_ids.includes(req.user.id) && d.user_ids.includes(other.id)) leaveVoice(sk);
+  }
+  notifyFriends(req.user.id, other.id);
+  io.to(`user:${req.user.id}`).emit('blocks:update');
+  res.json({ ok: true });
+});
+app.delete('/api/blocks/:uid', auth, (req, res) => {
+  db.blocks = db.blocks.filter((b) => !(b.blocker === req.user.id && b.blocked === req.params.uid));
+  save();
+  io.to(`user:${req.user.id}`).emit('blocks:update');
+  res.json({ ok: true });
+});
+
+// denúncias e relatos de problema
+const repRate = new Map();
+app.post('/api/reports', auth, (req, res) => {
+  const type = ['message', 'user', 'bug', 'server'].includes(req.body.type) ? req.body.type : 'bug';
+  const reason = cleanStr(req.body.reason, 60);
+  const details = cleanStr(req.body.details, 1500);
+  if (type === 'bug' && details.length < 5) return bad(res, 'Conte um pouco do que aconteceu.');
+  const t = Date.now();
+  const hits = (repRate.get(req.user.id) || []).filter((x) => t - x < 3600e3);
+  if (hits.length >= 15) return bad(res, 'Você já mandou muitas denúncias. Tente mais tarde.', 429);
+  hits.push(t); repRate.set(req.user.id, hits);
+  const r = { id: id(), type, reason, details, reporter: req.user.id, created_at: now(), status: 'aberta', page: cleanStr(req.body.page, 200) };
+  if (type === 'message') {
+    const m = db.messages.find((x) => x.id === req.body.target) || db.dm_messages.find((x) => x.id === req.body.target);
+    if (!m) return bad(res, 'Mensagem não encontrada.', 404);
+    r.target = m.id; r.target_user = m.author_id; r.snapshot = { content: m.content, attachments: m.attachments || [], created_at: m.created_at, where: m.channel_id ? 'canal' : 'conversa privada' };
+  }
+  if (type === 'user') {
+    const u = userById(String(req.body.target || ''));
+    if (!u) return bad(res, 'Pessoa não encontrada.', 404);
+    r.target = u.id; r.target_user = u.id;
+  }
+  db.reports.push(r); save();
+  db.users.filter(isAdmin).forEach((a) => io.to(`user:${a.id}`).emit('admin:report'));
+  res.json({ ok: true });
+});
+function requireAdmin(req, res) { if (!isAdmin(req.user)) { bad(res, 'Só a equipe da Lumix pode ver isso.', 403); return false; } return true; }
+app.get('/api/admin/reports', auth, (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  res.json(db.reports.slice().reverse().slice(0, 200).map((r) => ({ ...r, reporter_user: personOf(userById(r.reporter)), target_person: r.target_user ? { ...personOf(userById(r.target_user)), banned: !!userById(r.target_user)?.banned } : null })));
+});
+app.patch('/api/admin/reports/:rid', auth, (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  const r = db.reports.find((x) => x.id === req.params.rid);
+  if (!r) return bad(res, 'Não encontrada.', 404);
+  if (['aberta', 'resolvida', 'descartada'].includes(req.body.status)) r.status = req.body.status;
+  save(); res.json(r);
+});
+app.post('/api/admin/users/:uid/ban', auth, (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  const u = userById(req.params.uid);
+  if (!u || isAdmin(u)) return bad(res, 'Não dá para suspender essa conta.');
+  u.banned = !!req.body.banned;
+  if (u.banned) { const gone = db.sessions.filter((x) => x.user_id === u.id); db.sessions = db.sessions.filter((x) => x.user_id !== u.id); kickSessions(gone.map((x) => x.token)); }
+  save(); res.json({ ok: true, banned: u.banned });
+});
+
+// perfil de outra pessoa
+app.get('/api/users/:uid', auth, (req, res) => {
+  const u = userById(req.params.uid);
+  if (!u) return bad(res, 'Pessoa não encontrada.', 404);
+  const me = req.user.id;
+  const myServers = new Set(db.members.filter((m) => m.user_id === me).map((m) => m.server_id));
+  const mutual = db.members.filter((m) => m.user_id === u.id && myServers.has(m.server_id)).map((m) => serverById(m.server_id)).filter(Boolean).map((s) => ({ id: s.id, name: s.name, color: s.color, icon_url: s.icon_url }));
+  const f = friendRow(me, u.id);
+  const pv = privacyOf(u);
+  const showBio = u.id === me || pv.show_bio || areFriends(me, u.id);
+  res.json({
+    ...personOf(u), created_at: u.created_at, badges: badgesOf(u), accent: u.accent || '', banner_url: u.banner_url || '',
+    bio: showBio ? u.bio || '' : '', status_text: u.status_text || '', mutual_servers: mutual,
+    mutual_friends: friendIdsOf(me).filter((x) => friendIdsOf(u.id).includes(x)).length,
+    friendship: !f ? 'none' : f.status === 'accepted' ? 'friends' : f.from === me ? 'outgoing' : 'incoming', friendship_id: f?.id || null,
+    blocked: isBlocked(me, u.id), me: u.id === me,
+  });
+});
+
 // ---- convites
 app.get('/api/invite/:code', auth, (req, res) => {
   const s = db.servers.find((x) => x.invite_code === req.params.code);
@@ -1207,12 +1463,35 @@ app.post('/api/invite/:code/join', auth, (req, res) => {
 });
 
 // ---- config de chamada (STUN/TURN)
-app.get('/api/config', (req, res) => {
-  let iceServers = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }];
+// Servidores para as chamadas atravessarem a internet (STUN + TURN).
+// Sem TURN, chamadas entre redes diferentes (4G, operadoras com CGNAT) ficam mudas ou com tela preta.
+let meteredCache = { at: 0, list: null };
+async function iceServersFor(uid) {
+  const stun = { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] };
   if (process.env.ICE_SERVERS) {
-    try { iceServers = JSON.parse(process.env.ICE_SERVERS); } catch { /* mantém padrão */ }
+    try { return JSON.parse(process.env.ICE_SERVERS); } catch { /* ignora */ }
   }
-  res.json({ iceServers });
+  // Metered (grátis com cadastro): METERED_DOMAIN=seuapp.metered.live e METERED_API_KEY
+  if (process.env.METERED_DOMAIN && process.env.METERED_API_KEY) {
+    if (meteredCache.list && Date.now() - meteredCache.at < 30 * 60e3) return meteredCache.list;
+    try {
+      const r = await fetch(`https://${process.env.METERED_DOMAIN}/api/v1/turn/credentials?apiKey=${encodeURIComponent(process.env.METERED_API_KEY)}`);
+      const list = await r.json();
+      if (Array.isArray(list) && list.length) { meteredCache = { at: Date.now(), list: [stun, ...list] }; return meteredCache.list; }
+    } catch (e) { console.warn('Metered falhou:', e.message); }
+  }
+  // Padrão: TURN público do Open Relay (credencial temporária gerada aqui)
+  const host = process.env.TURN_HOST || 'staticauth.openrelay.metered.ca';
+  const secret = process.env.TURN_SECRET || 'openrelayprojectsecret';
+  const username = `${Math.floor(Date.now() / 1000) + 24 * 3600}:${uid || 'lumix'}`;
+  const credential = crypto.createHmac('sha1', secret).update(username).digest('base64');
+  return [stun, {
+    urls: [`turn:${host}:80`, `turn:${host}:80?transport=tcp`, `turn:${host}:443`, `turns:${host}:443?transport=tcp`],
+    username, credential,
+  }];
+}
+app.get('/api/config', auth, async (req, res) => {
+  res.json({ iceServers: await iceServersFor(req.user.id) });
 });
 
 // ---- front-end
@@ -1247,7 +1526,11 @@ function voiceList(vcid) {
       muted: st.muted, deafened: st.deafened, camera: st.camera, screen: st.screen };
   });
 }
+// chamadas em conversa privada usam a sala "dm:<id>"
+const dmOfKey = (k) => (typeof k === 'string' && k.startsWith('dm:') ? dmById(k.slice(3)) : null);
 function broadcastVoice(vcid) {
+  const d = dmOfKey(vcid);
+  if (d) { d.user_ids.forEach((u) => io.to(`user:${u}`).emit('voice:state', { channel_id: vcid, participants: voiceList(vcid) })); return; }
   const c = channelById(vcid);
   if (c) emitToChannel(c, 'voice:state', { channel_id: vcid, participants: voiceList(vcid) });
 }
@@ -1261,12 +1544,16 @@ function leaveVoice(sock) {
   io.to(`voice:${vcid}`).emit('rtc:peer-left', { socket_id: sock.id });
   sock.emit('voice:left', { channel_id: vcid });
   broadcastVoice(vcid);
+  const d = dmOfKey(vcid);
+  if (d && !voice.get(vcid)) d.user_ids.forEach((u) => io.to(`user:${u}`).emit('call:ended', { dm_id: d.id }));
 }
 
 io.use((sock, next) => {
-  const u = userFromCookie(sock.handshake.headers.cookie);
-  if (!u) return next(new Error('unauthorized'));
+  const ses = sessionFromCookie(sock.handshake.headers.cookie);
+  const u = ses && userById(ses.user_id);
+  if (!u || u.banned) return next(new Error('unauthorized'));
   sock.data.user = u;
+  sock.data.token = ses.token;
   next();
 });
 
@@ -1281,7 +1568,42 @@ io.on('connection', (sock) => {
     db.channels.filter((c) => c.server_id === sid && c.kind === 'voice' && canSee(c, uid)).forEach((c) => { out[c.id] = voiceList(c.id); });
     cb(out);
   });
-  sock.on('voice:join', (vcid, cb) => {
+  sock.on('voice:dmsnapshot', (cb) => {
+    if (typeof cb !== 'function') return;
+    const out = {};
+    db.dms.filter((d) => d.user_ids.includes(uid)).forEach((d) => { const k = `dm:${d.id}`; if (voice.get(k)) out[k] = voiceList(k); });
+    cb(out);
+  });
+  sock.on('call:decline', ({ dm_id } = {}) => {
+    const d = dmById(dm_id);
+    if (!d || !d.user_ids.includes(uid)) return;
+    io.to(`voice:dm:${d.id}`).emit('call:declined', { dm_id: d.id, by: sock.data.user.display_name });
+    d.user_ids.forEach((u) => io.to(`user:${u}`).emit('call:stop-ring', { dm_id: d.id }));
+  });
+  sock.on('voice:join', (vcid, opts, cb) => {
+    if (typeof opts === 'function') { cb = opts; opts = {}; }
+    const dmv = dmOfKey(vcid);
+    if (dmv) {
+      if (!dmv.user_ids.includes(uid)) return cb?.({ error: 'Conversa indisponível.' });
+      const other = dmv.user_ids.find((u) => u !== uid);
+      if (blockedEither(uid, other)) return cb?.({ error: 'Não é possível ligar para essa pessoa.' });
+      if (!areFriends(uid, other) && !sharesServer(uid, other)) return cb?.({ error: 'Vocês precisam ser amigos para ligar.' });
+      if (sock.data.voice) leaveVoice(sock);
+      const existing = voiceList(vcid);
+      if (!voice.has(vcid)) voice.set(vcid, new Map());
+      voice.get(vcid).set(sock.id, { user_id: uid, muted: false, deafened: false, camera: false, screen: false });
+      sock.data.voice = vcid;
+      sock.join(`voice:${vcid}`);
+      cb?.({ ok: true, peers: existing });
+      broadcastVoice(vcid);
+      // toca para a outra pessoa se ela ainda não está na chamada
+      if (!existing.some((p) => p.user_id === other)) {
+        io.to(`user:${other}`).emit('call:ring', { dm_id: dmv.id, from: personOf(sock.data.user), video: !!opts?.video });
+      } else {
+        dmv.user_ids.forEach((u) => io.to(`user:${u}`).emit('call:stop-ring', { dm_id: dmv.id }));
+      }
+      return;
+    }
     const c = channelById(vcid);
     if (!c || c.kind !== 'voice' || !canSee(c, uid)) return cb?.({ error: 'Canal indisponível.' });
     if (sock.data.voice) leaveVoice(sock);

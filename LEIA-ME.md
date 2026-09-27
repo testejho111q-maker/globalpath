@@ -39,7 +39,7 @@ Sem isso, no Render grátis contas, mensagens e arquivos somem quando o site rei
 6. Nos **Logs** do Render deve aparecer "MongoDB conectado". Pronto: dados, fotos e áudios ficam salvos.
 
 ## Chamadas que não conectam
-As chamadas são diretas entre os navegadores (WebRTC). Na maioria das redes funciona só com o servidor STUN do Google, que já vem configurado. Em algumas redes (4G de algumas operadoras, redes de empresa), é preciso um servidor **TURN**. Dá para criar um grátis em https://www.metered.ca/stun-turn e colocar na variável `ICE_SERVERS`, por exemplo:
+As chamadas são diretas entre os navegadores (WebRTC). Na maioria das redes funciona só com o servidor STUN do Google, que já vem configurado. Em algumas redes (4G de algumas operadoras, redes de empresa), é preciso um servidor **TURN**. O Lumix já usa um TURN público grátis (Open Relay). Para uma conexão mais estável, crie uma conta grátis em https://www.metered.ca/stun-turn e adicione no Render `METERED_DOMAIN` (ex.: seuapp.metered.live) e `METERED_API_KEY`. Ou informe seus próprios servidores em `ICE_SERVERS`, por exemplo:
 
 ```
 ICE_SERVERS=[{"urls":"stun:stun.l.google.com:19302"},{"urls":"turn:SEU-SERVIDOR:80","username":"USUARIO","credential":"SENHA"}]
