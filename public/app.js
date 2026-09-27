@@ -42,6 +42,9 @@ const ICONS = {
   download: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/>',
   paperclip: '<path d="m21.4 11.1-9.2 9.2a6 6 0 0 1-8.5-8.5l9.2-9.2a4 4 0 0 1 5.7 5.7l-9.2 9.2a2 2 0 0 1-2.8-2.8l8.5-8.5"/>',
   image: '<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="m21 15-5-5L5 21"/>',
+  mail: '<rect x="2" y="4" width="20" height="16" rx="2"/><path d="m22 7-10 6L2 7"/>',
+  check: '<path d="M20 6 9 17l-5-5"/>',
+  userMinus: '<path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><path d="M23 11h-6"/>',
   radio: '<circle cx="12" cy="12" r="2"/><path d="M16.2 7.8a6 6 0 0 1 0 8.4M7.8 16.2a6 6 0 0 1 0-8.4M19.1 4.9a10 10 0 0 1 0 14.2M4.9 19.1a10 10 0 0 1 0-14.2"/>',
   chat: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
   compass: '<circle cx="12" cy="12" r="10"/><path d="m16.2 7.8-2.1 6.3-6.3 2.1 2.1-6.3z"/>',
@@ -150,6 +153,9 @@ const S = {
   roles: {},         // sid -> cargos
   dmId: null,
   streamer: false,
+  friends: { friends: [], incoming: [], outgoing: [] },
+  homeView: 'friends',
+  friendsTab: 'online',
   dms: [],
   ssRefresh: null,
   collapsed: (() => { try { return new Set(JSON.parse(localStorage.getItem('gp_collapsed') || '[]')); } catch { return new Set(); } })(),
@@ -182,7 +188,8 @@ async function route() {
     renderApp();
   } else {
     S.serverId = null; S.channelId = null; S.dmId = null;
-    if (p !== '/') history.replaceState({}, '', '/');
+    S.homeView = p === '/requests' ? 'requests' : 'friends';
+    if (p !== '/' && p !== '/requests') history.replaceState({}, '', '/');
     renderApp();
   }
 }
@@ -198,7 +205,8 @@ function renderAuth(mode = 'login') {
       <div class="brand"><img class="brand-logo" src="/logo-192.png" alt=""><span><b>LUMIX</b><small>Seu espaço para se conectar.</small></span></div>
       <h1>${isLogin ? 'Bem-vindo de volta!' : 'Criar uma conta'}</h1>
       <p class="sub">${joining ? 'Entre para aceitar o convite do servidor.' : isLogin ? 'Que bom te ver de novo.' : 'Leva menos de um minuto.'}</p>
-      ${isLogin ? '' : `<div class="field"><label>Nome de exibição</label><input class="input" name="display_name" maxlength="32" autocomplete="nickname" required></div>`}
+      ${isLogin ? '' : `<div class="field"><label>Nome de exibição</label><input class="input" name="display_name" maxlength="32" autocomplete="nickname" required></div>
+      <div class="field"><label>Nome de usuário</label><div class="at-input"><span>@</span><input class="input" name="username" maxlength="20" autocomplete="username" placeholder="seunome" spellcheck="false"></div><span class="hint">É com ele que seus amigos te adicionam. Letras minúsculas, números, _ e ponto.</span></div>`}
       <div class="field"><label>E-mail</label><input class="input" name="email" type="email" autocomplete="email" required></div>
       <div class="field"><label>Senha</label><input class="input" name="password" type="password" autocomplete="${isLogin ? 'current-password' : 'new-password'}" required></div>
       <div class="error-text" id="auth-err"></div>
@@ -207,6 +215,12 @@ function renderAuth(mode = 'login') {
     </form>
   </div>`;
   $('#auth-switch').onclick = () => renderAuth(isLogin ? 'register' : 'login');
+  const un = $('[name=username]');
+  if (un) {
+    let touched = false;
+    un.oninput = () => { touched = true; un.value = un.value.toLowerCase().replace(/[^a-z0-9_.]/g, ''); };
+    $('[name=display_name]').oninput = (e) => { if (!touched) un.value = e.target.value.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9_.]/g, '').slice(0, 20); };
+  }
   $('#auth-form input').focus();
   $('#auth-form').onsubmit = async (e) => {
     e.preventDefault();
@@ -225,6 +239,7 @@ function renderAuth(mode = 'login') {
 
 async function startSession() {
   [S.servers, S.dms] = await Promise.all([api('/api/servers'), api('/api/dms').catch(() => [])]);
+  await loadFriends();
   connectSocket();
   route();
 }
@@ -257,6 +272,18 @@ function connectSocket() {
     }
     renderRail();
     if (!S.serverId) renderSidebar();
+  });
+  socket.on('friends:update', async () => {
+    await loadFriends();
+    renderRail();
+    if (!S.serverId) { renderSidebar(); if (!S.dmId && !(S.homeView === 'friends' && S.friendsTab === 'add' && $('#add-form'))) renderMain(); }
+  });
+  socket.on('friends:request', ({ from, message }) => {
+    toast(`👋 ${from.display_name} quer ser seu amigo${message ? `: “${message}”` : ''}`);
+  });
+  socket.on('dm:removed', ({ id }) => {
+    S.dms = S.dms.filter((d) => d.id !== id);
+    if (!S.serverId && S.dmId === id) navigate('/', true); else { renderRail(); if (!S.serverId) renderSidebar(); }
   });
   socket.on('dm:deleted', ({ id, dm_id }) => {
     if (S.messages[dm_id]) S.messages[dm_id] = S.messages[dm_id].filter((m) => m.id !== id);
@@ -314,8 +341,9 @@ async function refreshServer(sid) {
     const c = chan();
     if (c?.kind === 'text') {
       const box = $('#messages');
-      const canNow = !!$('#composer'); 
-      if (canNow !== !!c.can_post || !box) renderMain(); else renderHead();
+      const canNow = !!$('#composer');
+      const attachKey = JSON.stringify(c.can_attach || {});
+      if (canNow !== !!c.can_post || !box || $('#composer')?.dataset.attach !== attachKey) renderMain(); else renderHead();
     } else if (c?.kind === 'voice' && !(call && call.channelId === c.id)) renderMain();
     else renderHead();
     S.ssRefresh?.();
@@ -428,7 +456,7 @@ function renderSidebar() {
     <div class="user-bar">
       <button class="me" id="me-btn" title="Configurações de perfil">
         <span style="position:relative">${avatarHtml(S.me)}<span class="dot on"></span></span>
-        <span style="min-width:0;text-align:left"><div class="nm">${esc(S.me.display_name)}</div><div class="st">Online</div></span>
+        <span style="min-width:0;text-align:left"><div class="nm">${esc(S.me.display_name)}</div><div class="st">${S.streamer ? 'Modo streamer' : '@' + esc(S.me.username || '')}</div></span>
       </button>
       ${call ? `<button class="icon-btn ${call.muted ? 'on' : ''}" id="ub-mute" title="${call.muted ? 'Ativar microfone' : 'Silenciar'}">${icon(call.muted ? 'micOff' : 'mic')}</button>
       <button class="icon-btn ${call.deafened ? 'on' : ''}" id="ub-deaf" title="${call.deafened ? 'Ativar áudio' : 'Desativar áudio'}">${icon(call.deafened ? 'headOff' : 'headphones')}</button>` : ''}
@@ -457,6 +485,7 @@ function renderSidebar() {
   });
   $('#server-menu-btn')?.addEventListener('click', (e) => serverMenu(e.currentTarget));
   $('#dm-new')?.addEventListener('click', newDmDialog);
+  $('#home-search')?.addEventListener('click', () => quickSwitcher());
   $('#me-btn').onclick = () => userSettings('profile');
   $('#ub-settings').onclick = () => userSettings('profile');
   $('#ub-mute')?.addEventListener('click', toggleMute);
@@ -470,12 +499,13 @@ function renderHead() {
   const h = $('.main-head'); if (!h) return;
   const c = chan();
   h.innerHTML = `<button class="icon-btn menu-toggle" id="menu-toggle">${icon('menu')}</button>
-    ${!S.serverId && S.dmId ? (() => { const d = S.dms.find((x) => x.id === S.dmId); return d ? `${avatarHtml(d.user, 'sm')}<span>${esc(d.user.display_name)}</span><span class="topic">${d.user.online ? 'Online' : 'Offline'}</span>` : ''; })() : c ? `${icon(c.kind === 'voice' ? 'volume' : c.read_only ? 'megaphone' : 'hash', 'muted')}<span>${esc(c.name)}</span>${c.topic ? `<span class="topic">${esc(c.topic)}</span>` : ''}` : `<span>${esc(current()?.name || 'Conversas')}</span>`}
+    ${!S.serverId && S.dmId ? (() => { const d = S.dms.find((x) => x.id === S.dmId); return d ? `${avatarHtml(d.user, 'sm')}<span>${esc(d.user.display_name)}</span><span class="topic">@${esc(d.user.username || '')} · ${d.user.online ? 'Online' : 'Offline'}</span>${!S.friends.friends.some((f) => f.user.id === d.user.id) && d.user.username ? `<button class="btn ghost sm-btn" id="dm-add-friend" style="margin-left:auto">${icon('userPlus')}Adicionar amigo</button>` : ''}` : ''; })() : c ? `${icon(c.kind === 'voice' ? 'volume' : c.read_only ? 'megaphone' : 'hash', 'muted')}<span>${esc(c.name)}</span>${c.topic ? `<span class="topic">${esc(c.topic)}</span>` : ''}` : `<span>${esc(current()?.name || 'Conversas')}</span>`}
     <span class="spacer"></span>
     ${current() ? `<button class="icon-btn" id="head-invite" title="Convidar pessoas">${icon('userPlus')}</button>
     <button class="icon-btn" id="head-members" title="Membros">${icon('users')}</button>` : ''}`;
   $('#menu-toggle').onclick = () => setNav(true);
   $('#head-invite')?.addEventListener('click', () => inviteDialog());
+  $('#dm-add-friend')?.addEventListener('click', () => { const d = S.dms.find((x) => x.id === S.dmId); if (d) addFriendByUsername(d.user.username); });
   $('#head-members')?.addEventListener('click', () => serverSettings('members'));
 }
 
@@ -484,19 +514,21 @@ function renderMain() {
   const s = current();
   const c = chan();
   if (!s && S.dmId && threadFor()) return renderThread(el);
+  if (!s && S.homeView === 'requests') return renderRequestsPage(el);
+  if (!s && (S.friends.friends.length || S.friends.incoming.length || S.friends.outgoing.length || S.friendsTab !== 'online' || S.dms.length)) return renderFriendsPage(el);
   if (!s) {
     el.innerHTML = `<div class="main-head"></div>
       <div class="empty"><div>
         <div class="ico">${icon('compass')}</div>
         <h2>Olá, ${esc(S.me.display_name)}!</h2>
         <p>${S.servers.length ? 'Escolha um servidor na barra lateral ou crie um novo.' : 'Crie seu primeiro servidor ou entre em um com um convite de um amigo.'}</p>
-        <div class="row"><button class="btn primary" id="e-create">${icon('plus')}Criar servidor</button><button class="btn" id="e-ai">${icon('sparkle')}Montar com IA</button><button class="btn" id="e-join">${icon('link')}Tenho um convite</button><button class="btn" id="e-dm">${icon('chat')}Nova conversa</button></div>
+        <div class="row"><button class="btn primary" id="e-create">${icon('plus')}Criar servidor</button><button class="btn" id="e-ai">${icon('sparkle')}Montar com IA</button><button class="btn" id="e-join">${icon('link')}Tenho um convite</button><button class="btn" id="e-friend">${icon('userPlus')}Adicionar amigo</button></div>
         <p class="hint" style="margin-top:18px">Dica: aperte <kbd>?</kbd> para ver as teclas de atalho.</p>
       </div></div>`;
     renderHead();
     $('#e-create').onclick = () => createServerDialog();
     $('#e-join').onclick = () => joinDialog();
-    $('#e-dm').onclick = () => newDmDialog();
+    $('#e-friend').onclick = () => { S.friendsTab = 'add'; renderFriendsPage(el); };
     $('#e-ai').onclick = () => aiBuildDialog();
     return;
   }
@@ -552,7 +584,7 @@ function renderThread(el) {
   const canVoice = t.attach.audio && !!window.MediaRecorder && !!navigator.mediaDevices?.getUserMedia;
   el.innerHTML = `<div class="main-head"></div>
     <div class="messages" id="messages"></div>
-    ${t.canPost ? `<form class="composer" id="composer">
+    ${t.canPost ? `<form class="composer" id="composer" data-attach="${esc(JSON.stringify(t.chan?.can_attach || {}))}">
       <div class="pending hidden" id="pending"></div>
       <div class="composer-box" id="composer-box">
         ${canFiles ? `<button type="button" class="attach" id="attach-btn" title="Enviar ${[t.attach.images && 'imagem', t.attach.files && 'arquivo', t.attach.audio && 'áudio'].filter(Boolean).join(', ')}">${icon('plus')}</button>` : ''}
@@ -566,6 +598,12 @@ function renderThread(el) {
     </form>`
     : `<div class="composer"><div class="composer-box readonly">${icon('lock')}Você não tem permissão para enviar mensagens neste canal.</div></div>`}`;
   renderHead();
+  if (t.dm?.request) {
+    $('#composer')?.insertAdjacentHTML('beforebegin', `<div class="req-banner">${avatarHtml(t.dm.user, 'sm')}<span><b>${esc(t.dm.user.display_name)}</b> ainda não é seu amigo e quer conversar com você.</span>
+      <button class="btn ghost" id="req-no">Recusar</button><button class="btn primary" id="req-yes">Aceitar</button></div>`);
+    $('#req-yes').onclick = () => acceptDm(t.dm.id, true);
+    $('#req-no').onclick = () => rejectDm(t.dm.id);
+  }
   const box = $('#messages');
   box._stick = true;
   box.addEventListener('scroll', () => { box._stick = box.scrollHeight - box.scrollTop - box.clientHeight < 120; });
@@ -617,6 +655,7 @@ function renderThread(el) {
     drawPending();
     try {
       const m = await api(t.base, { method: 'POST', body: { content, attachments: ids } });
+      if (t.dm?.request) { t.dm.request = false; $('.req-banner')?.remove(); renderSidebar(); renderRail(); }
       old.forEach((p) => p.preview && URL.revokeObjectURL(p.preview));
       addMessage(t.id, m);
     } catch (err) { toast(err.message, true); ta.value = content; pending.push(...old.filter((p) => !extraIds.includes(p.att?.id))); drawPending(); }
@@ -810,23 +849,155 @@ async function openDm(userId) {
     navigate(`/dm/${d.id}`);
   } catch (e) { toast(e.message, true); }
 }
-const totalUnread = () => S.dms.reduce((n, d) => n + (d.unread || 0), 0);
+const totalUnread = () => S.dms.reduce((n, d) => n + (d.unread || 0) + (d.request && !d.unread ? 1 : 0), 0) + (S.friends?.incoming.length || 0);
+// ---------------------------------------------------------------- amigos
+async function loadFriends() {
+  try { S.friends = await api('/api/friends'); } catch { /* mantém o que tinha */ }
+}
+const pendingCount = () => S.friends.incoming.length;
+const requestDms = () => S.dms.filter((d) => d.request);
+
 function renderHomeSidebar() {
-  return `<div class="sidebar-head"><div class="server-name-btn" style="cursor:default"><span class="n">Conversas</span></div>
-      <button class="icon-btn" id="dm-new" title="Nova conversa">${icon('plus')}</button></div>
+  const normal = S.dms.filter((d) => !d.request);
+  const reqs = requestDms().length;
+  return `<div class="sidebar-head"><button class="server-name-btn" id="home-search"><span class="n muted-search">Encontrar ou começar conversa</span></button></div>
     <div class="channels">
-      <button class="channel ${!S.dmId ? 'active' : ''}" data-go="/">${icon('users')}<span class="n">Amigos e servidores</span></button>
-      <div class="cat"><span class="cat-name" style="cursor:default"><span>Mensagens diretas</span></span></div>
-      ${S.dms.length ? S.dms.map((d) => `
+      <button class="channel home-link ${!S.dmId && S.homeView === 'friends' ? 'active' : ''}" data-go="/">${icon('users')}<span class="n">Amigos</span>${pendingCount() ? `<span class="unread">${pendingCount()}</span>` : ''}</button>
+      <button class="channel home-link ${!S.dmId && S.homeView === 'requests' ? 'active' : ''}" data-go="/requests">${icon('mail')}<span class="n">Solicitações de mensagens</span>${reqs ? `<span class="unread">${reqs}</span>` : ''}</button>
+      <div class="cat"><span class="cat-name" style="cursor:default"><span>Mensagens diretas</span></span><span class="cat-actions" style="opacity:1"><button class="icon-btn" id="dm-new" title="Nova conversa">${icon('plus')}</button></span></div>
+      ${normal.length ? normal.map((d) => `
         <button class="channel dm-row ${d.id === S.dmId ? 'active' : ''}" data-go="/dm/${d.id}">
           <span style="position:relative">${avatarHtml(d.user, 'sm')}<span class="dot sm ${d.user.online ? 'on' : ''}"></span></span>
           <span class="n"><span class="dm-name">${esc(d.user.display_name)}</span>${d.last_message ? `<small>${d.last_message.mine ? 'Você: ' : ''}${esc(d.last_message.content)}</small>` : ''}</span>
           ${d.unread ? `<span class="unread">${d.unread > 99 ? '99+' : d.unread}</span>` : ''}
-        </button>`).join('') : '<p class="hint" style="padding:6px 8px">Nenhuma conversa ainda. Clique em + para começar.</p>'}
+        </button>`).join('') : '<p class="hint" style="padding:6px 8px">Nenhuma conversa ainda.</p>'}
     </div>`;
 }
+
+function renderFriendsPage(el) {
+  const tab = S.friendsTab;
+  const f = S.friends;
+  el.innerHTML = `<div class="main-head friends-head">
+      <button class="icon-btn menu-toggle" id="menu-toggle">${icon('menu')}</button>
+      ${icon('users', 'muted')}<span>Amigos</span><span class="dotsep">•</span>
+      <div class="ftabs">
+        <button data-ftab="online" class="${tab === 'online' ? 'on' : ''}">Disponível</button>
+        <button data-ftab="all" class="${tab === 'all' ? 'on' : ''}">Todos</button>
+        <button data-ftab="pending" class="${tab === 'pending' ? 'on' : ''}">Pendente${pendingCount() ? ` <span class="unread">${pendingCount()}</span>` : ''}</button>
+        <button data-ftab="add" class="add ${tab === 'add' ? 'on' : ''}">Adicionar amigo</button>
+      </div>
+    </div>
+    <div class="friends-body" id="friends-body"></div>`;
+  $('#menu-toggle').onclick = () => setNav(true);
+  $$('[data-ftab]', el).forEach((b) => { b.onclick = () => { S.friendsTab = b.dataset.ftab; renderFriendsPage(el); }; });
+  const body = $('#friends-body');
+  const row = (u, actions, sub) => `
+    <div class="friend-row">
+      <span style="position:relative">${avatarHtml(u)}<span class="dot ${u.online ? 'on' : ''}"></span></span>
+      <div class="nm"><b>${esc(u.display_name)}</b> <span class="uname">@${esc(u.username)}</span><small>${sub}</small></div>
+      <div class="friend-actions">${actions}</div>
+    </div>`;
+  if (tab === 'add') {
+    body.innerHTML = `
+      <div class="add-friend">
+        <h2>Adicionar amigo</h2>
+        <p class="sub">Você pode adicionar amigos com o nome de usuário Lumix deles. O seu é <b>@${esc(S.me.username)}</b> <button class="link-btn" id="copy-me">copiar</button></p>
+        <form class="add-box" id="add-form">
+          <div class="add-row"><span class="at">@</span><input id="add-user" maxlength="21" placeholder="Insira um nome de usuário" autocomplete="off" spellcheck="false">
+            <button class="btn primary" id="add-send" disabled>Enviar pedido de amizade</button></div>
+          <div class="add-msg"><textarea id="add-msg" maxlength="120" rows="2" placeholder="Personalize sua solicitação (opcional)"></textarea><span class="count" id="add-count">120</span></div>
+        </form>
+        <p class="hint">O que você escrever aqui também aparecerá nas suas mensagens diretas se vocês se tornarem amigos.</p>
+        <div class="add-result" id="add-result"></div>
+      </div>`;
+    const inp = $('#add-user'), msg = $('#add-msg'), btn = $('#add-send');
+    inp.oninput = () => { inp.value = inp.value.toLowerCase().replace(/^@/, '').replace(/[^a-z0-9_.]/g, ''); btn.disabled = inp.value.length < 3; $('#add-result').textContent = ''; $('#add-result').className = 'add-result'; };
+    msg.oninput = () => { $('#add-count').textContent = 120 - msg.value.length; };
+    $('#copy-me').onclick = () => { navigator.clipboard?.writeText('@' + S.me.username).then(() => toast('Nome de usuário copiado!')).catch(() => {}); };
+    $('#add-form').onsubmit = async (e) => {
+      e.preventDefault(); btn.disabled = true;
+      try {
+        const r = await api('/api/friends', { method: 'POST', body: { username: inp.value, message: msg.value } });
+        $('#add-result').className = 'add-result ok';
+        $('#add-result').textContent = r.accepted ? `Agora você e ${r.user.display_name} são amigos! 🎉` : `Pedido enviado para ${r.user.display_name}!`;
+        inp.value = ''; msg.value = ''; $('#add-count').textContent = '120';
+        await loadFriends(); renderSidebar();
+      } catch (err) { $('#add-result').className = 'add-result err'; $('#add-result').textContent = err.message; btn.disabled = false; }
+    };
+    setTimeout(() => inp.focus(), 30);
+    return;
+  }
+  if (tab === 'pending') {
+    const list = [...f.incoming.map((x) => ({ ...x, dir: 'in' })), ...f.outgoing.map((x) => ({ ...x, dir: 'out' }))];
+    body.innerHTML = `<div class="flist-title">Pendente — ${list.length}</div>` + (list.length ? list.map((x) => row(x.user,
+      x.dir === 'in'
+        ? `<button class="round ok" data-accept="${x.id}" title="Aceitar">${icon('check')}</button><button class="round no" data-del="${x.id}" title="Recusar">${icon('x')}</button>`
+        : `<button class="round no" data-del="${x.id}" title="Cancelar pedido">${icon('x')}</button>`,
+      `${x.dir === 'in' ? 'Pedido de amizade recebido' : 'Pedido de amizade enviado'}${x.message ? ` · “${esc(x.message)}”` : ''}`)).join('')
+      : emptyFriends('Não há pedidos de amizade pendentes.'));
+  } else {
+    const list = tab === 'online' ? f.friends.filter((x) => x.user.online) : f.friends;
+    body.innerHTML = `<input class="input fsearch" id="fsearch" placeholder="Buscar"><div class="flist-title">${tab === 'online' ? 'Disponível' : 'Todos os amigos'} — ${list.length}</div>
+      <div id="flist">${list.length ? list.map((x) => row(x.user,
+        `<button class="round" data-msg="${x.user.id}" title="Mensagem">${icon('chat')}</button><button class="round no" data-del="${x.id}" data-name="${esc(x.user.display_name)}" title="Desfazer amizade">${icon('userMinus')}</button>`,
+        x.user.online ? 'Online' : 'Offline')).join('')
+        : emptyFriends(tab === 'online' ? 'Nenhum amigo online agora.' : 'Você ainda não tem amigos aqui. Que tal adicionar alguém?')}</div>`;
+    $('#fsearch').oninput = (e) => {
+      const q = e.target.value.toLowerCase();
+      $$('.friend-row', body).forEach((r) => { r.style.display = r.textContent.toLowerCase().includes(q) ? '' : 'none'; });
+    };
+  }
+  $$('[data-accept]', body).forEach((b) => { b.onclick = async () => { try { await api(`/api/friends/${b.dataset.accept}/accept`, { method: 'POST' }); await loadFriends(); renderApp(); toast('Pedido aceito!'); } catch (e) { toast(e.message, true); } }; });
+  $$('[data-del]', body).forEach((b) => {
+    b.onclick = async () => {
+      if (b.dataset.name && !confirm(`Desfazer amizade com ${b.dataset.name}?`)) return;
+      try { await api(`/api/friends/${b.dataset.del}`, { method: 'DELETE' }); await loadFriends(); renderApp(); } catch (e) { toast(e.message, true); }
+    };
+  });
+  $$('[data-msg]', body).forEach((b) => { b.onclick = () => openDm(b.dataset.msg); });
+  $('[data-go-add]', body)?.addEventListener('click', () => { S.friendsTab = 'add'; renderFriendsPage(el); });
+}
+function emptyFriends(text) {
+  return `<div class="empty" style="padding:40px 0"><div><div class="ico">${icon('users')}</div><p>${text}</p><button class="btn primary" data-go-add>${icon('userPlus')}Adicionar amigo</button></div></div>`;
+}
+
+function renderRequestsPage(el) {
+  const list = requestDms();
+  el.innerHTML = `<div class="main-head"><button class="icon-btn menu-toggle" id="menu-toggle">${icon('menu')}</button>${icon('mail', 'muted')}<span>Solicitações de mensagens</span></div>
+    <div class="friends-body">
+      <p class="hint" style="margin:0 0 12px">Mensagens de quem ainda não é seu amigo ficam aqui até você aceitar.</p>
+      ${list.length ? list.map((d) => `
+        <div class="friend-row" data-open="${d.id}" style="cursor:pointer">
+          <span style="position:relative">${avatarHtml(d.user)}<span class="dot ${d.user.online ? 'on' : ''}"></span></span>
+          <div class="nm"><b>${esc(d.user.display_name)}</b> <span class="uname">@${esc(d.user.username)}</span><small>${esc(d.last_message?.content || 'Quer conversar com você')}</small></div>
+          <div class="friend-actions"><button class="round ok" data-acc="${d.id}" title="Aceitar">${icon('check')}</button><button class="round no" data-rej="${d.id}" title="Recusar">${icon('x')}</button></div>
+        </div>`).join('') : emptyRequests()}
+    </div>`;
+  $('#menu-toggle').onclick = () => setNav(true);
+  $$('[data-open]', el).forEach((r) => { r.onclick = (e) => { if (!e.target.closest('button')) navigate(`/dm/${r.dataset.open}`); }; });
+  $$('[data-acc]', el).forEach((b) => { b.onclick = () => acceptDm(b.dataset.acc, true); });
+  $$('[data-rej]', el).forEach((b) => { b.onclick = () => rejectDm(b.dataset.rej); });
+}
+function emptyRequests() {
+  return `<div class="empty" style="padding:40px 0"><div><div class="ico">${icon('mail')}</div><p>Nenhuma solicitação de mensagem.</p></div></div>`;
+}
+async function acceptDm(did, open) {
+  try { const d = await api(`/api/dms/${did}/accept`, { method: 'POST' }); upsertDm(d); if (open) navigate(`/dm/${did}`); else renderApp(); } catch (e) { toast(e.message, true); }
+}
+async function rejectDm(did) {
+  if (!confirm('Recusar e apagar essa conversa?')) return;
+  try { await api(`/api/dms/${did}`, { method: 'DELETE' }); S.dms = S.dms.filter((d) => d.id !== did); navigate('/requests'); } catch (e) { toast(e.message, true); }
+}
+async function addFriendByUsername(username) {
+  try {
+    const r = await api('/api/friends', { method: 'POST', body: { username } });
+    toast(r.accepted ? `Agora vocês são amigos! 🎉` : `Pedido de amizade enviado para ${r.user.display_name}.`);
+    await loadFriends(); renderSidebar();
+  } catch (e) { toast(e.message, true); }
+}
+
 async function newDmDialog() {
-  const m = openModal(`<h2>Nova conversa</h2><p class="sub">Converse no privado com quem está nos mesmos servidores que você.</p>
+  const m = openModal(`<h2>Nova conversa</h2><p class="sub">Converse no privado com seus amigos ou com quem está nos mesmos servidores que você.</p>
     <input class="input" id="dm-q" placeholder="Buscar pelo nome"><div class="people" id="dm-list"><div class="spinner" style="margin:16px auto"></div></div>`);
   let people = [];
   const draw = () => {
@@ -834,7 +1005,7 @@ async function newDmDialog() {
     const list = people.filter((p) => p.display_name.toLowerCase().includes(q));
     $('#dm-list', m).innerHTML = list.length ? list.map((p) => `
       <button class="member-row person" data-dm="${p.id}"><span style="position:relative">${avatarHtml(p)}<span class="dot ${p.online ? 'on' : ''}"></span></span>
-        <div class="nm"><b>${esc(p.display_name)}</b><small>${p.online ? 'Online' : 'Offline'}</small></div>${icon('send')}</button>`).join('')
+        <div class="nm"><b>${esc(p.display_name)}</b><small>@${esc(p.username || '')} · ${p.friend ? 'Amigo' : 'Mesmo servidor'} · ${p.online ? 'Online' : 'Offline'}</small></div>${icon('send')}</button>`).join('')
       : `<p class="hint" style="padding:12px 4px">${people.length ? 'Ninguém com esse nome.' : 'Você ainda não está em servidores com outras pessoas. Convide amigos para um servidor primeiro.'}</p>`;
     $$('[data-dm]', m).forEach((b) => { b.onclick = () => openDm(b.dataset.dm); });
   };
@@ -1424,7 +1595,7 @@ function channelSettingsDialog(cid) {
       <div class="switch"><span>${icon('image')} Imagens</span><input type="checkbox" name="allow_images" ${c.allow?.images === false ? '' : 'checked'}></div>
       <div class="switch"><span>${icon('file')} Arquivos e vídeos</span><input type="checkbox" name="allow_files" ${c.allow?.files === false ? '' : 'checked'}></div>
       <div class="switch"><span>${icon('mic')} Áudios e mensagens de voz</span><input type="checkbox" name="allow_audio" ${c.allow?.audio === false ? '' : 'checked'}></div>
-      <p class="hint" style="margin:6px 0 10px">Desligue os três para deixar o canal <b>só texto</b>. A Staff (quem gerencia mensagens) sempre pode enviar.</p>
+      <p class="hint" style="margin:6px 0 10px">Desligue os três para deixar o canal <b>só texto</b>. Vale para todo mundo, inclusive a Staff.</p>
       <h4 class="perm-title">Acesso</h4>` : ''}
       <div class="switch"><span>Canal privado <small class="hint" style="display:block">Só os cargos escolhidos veem o canal.</small></span><input type="checkbox" name="private" ${priv ? 'checked' : ''}></div>
       <div id="ec-roles" class="${priv ? '' : 'hidden'}" style="padding-top:10px">${roleChecks(c.allowed_roles || [])}</div>
@@ -1661,12 +1832,14 @@ async function ssMembers(el) {
       <div class="member-row"><span style="position:relative">${avatarHtml(u)}<span class="dot ${u.online ? 'on' : ''}"></span></span>
         <div class="nm"><b style="color:${safeColor(u.color) || 'inherit'}">${esc(u.display_name)}</b> ${u.is_owner ? '<span class="badge">DONO</span>' : ''}
           <div class="chips">${rl.filter((r) => u.role_ids.includes(r.id)).map((r) => `<span class="chip"><span class="role-dot" style="background:${safeColor(r.color) || '#99aab5'}"></span>${esc(r.name)}</span>`).join('')}</div>
-          <small>${u.online ? 'Online' : 'Offline'} · entrou em ${new Date(u.joined_at).toLocaleDateString('pt-BR')}</small></div>
+          <small>@${esc(u.username || '')} · ${u.online ? 'Online' : 'Offline'} · entrou em ${new Date(u.joined_at).toLocaleDateString('pt-BR')}</small></div>
         ${u.id !== S.me.id ? `<button class="icon-btn" data-msg="${u.id}" title="Mandar mensagem">${icon('chat')}</button>` : ''}
+        ${u.id !== S.me.id && u.username && !S.friends.friends.some((f) => f.user.id === u.id) ? `<button class="icon-btn" data-addf="${esc(u.username)}" title="Adicionar amigo">${icon('userPlus')}</button>` : ''}
         ${p.manage_roles && rl.length ? `<button class="btn ghost" data-roles="${u.id}">Cargos</button>` : ''}
         ${p.kick && !u.is_owner && u.id !== S.me.id ? `<button class="btn danger" data-kick="${u.id}" data-name="${esc(u.display_name)}">Remover</button>` : ''}
       </div>`).join('')}`;
     $$('[data-msg]', el).forEach((b) => { b.onclick = () => openDm(b.dataset.msg); });
+    $$('[data-addf]', el).forEach((b) => { b.onclick = () => addFriendByUsername(b.dataset.addf); });
     $$('[data-kick]', el).forEach((b) => {
       b.onclick = async () => {
         if (!confirm(`Remover ${b.dataset.name} do servidor?`)) return;
@@ -1754,16 +1927,18 @@ function userSettings(tab = 'profile') {
   show(tab);
 }
 function usProfile(el) {
-  const st = { display_name: S.me.display_name, avatar_url: S.me.avatar_url };
+  const st = { display_name: S.me.display_name, avatar_url: S.me.avatar_url, username: S.me.username };
   el.innerHTML = `<h3>Perfil</h3>
     <div class="upload-row"><div id="up-prev"></div><div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn" id="up-up">Alterar foto</button><button class="btn ghost" id="up-rm">Remover</button></div></div>
     <div class="field"><label>Nome de exibição</label><input class="input" id="up-name" maxlength="32" value="${esc(st.display_name)}"></div>
+    <div class="field"><label>Nome de usuário</label><div class="at-input"><span>@</span><input class="input" id="up-user" maxlength="20" value="${esc(S.me.username || '')}" spellcheck="false"></div><span class="hint">Seus amigos usam esse nome para te adicionar.</span></div>
     <div class="field"><label>E-mail</label><input class="input" value="${esc(S.me.email)}" disabled></div>
     <div class="error-text" id="up-err"></div>
     <button class="btn primary" id="up-save">Salvar alterações</button>`;
   const prev = () => { $('#up-prev', el).innerHTML = avatarHtml({ ...st, display_name: st.display_name || '?' }, 'lg'); };
   prev();
   $('#up-name', el).oninput = (e) => { st.display_name = e.target.value; prev(); };
+  $('#up-user', el).oninput = (e) => { e.target.value = e.target.value.toLowerCase().replace(/[^a-z0-9_.]/g, ''); st.username = e.target.value; };
   $('#up-up', el).onclick = async () => { const u = await pickImage(); if (u) { st.avatar_url = u; prev(); } };
   $('#up-rm', el).onclick = () => { st.avatar_url = ''; prev(); };
   $('#up-save', el).onclick = async (e) => {
