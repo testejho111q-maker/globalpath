@@ -14,14 +14,20 @@ const SESSION_DAYS = 30;
 
 // ---------------------------------------------------------------- banco
 fs.mkdirSync(DATA_DIR, { recursive: true });
-const EMPTY = { users: [], sessions: [], servers: [], members: [], channels: [], messages: [], roles: [], dms: [], dm_messages: [] };
+const EMPTY = { users: [], sessions: [], servers: [], members: [], channels: [], messages: [], roles: [], dms: [], dm_messages: [], uploads: [] };
 let db;
 try {
   db = { ...JSON.parse(JSON.stringify(EMPTY)), ...JSON.parse(fs.readFileSync(DB_FILE, 'utf8')) };
 } catch {
   db = JSON.parse(JSON.stringify(EMPTY));
 }
+// armazenamento permanente (MongoDB), se configurado
+const { createStore } = require('./storage');
+const store = process.env.MONGODB_URI ? createStore({ uri: process.env.MONGODB_URI, dbName: process.env.MONGODB_DB }) : null;
+if (!store) console.warn('Aviso: MONGODB_URI não configurado — os dados ficam só no disco local.');
+
 // migração de dados antigos
+function migrate() {
 db.servers.forEach((s) => {
   if (!Array.isArray(s.categories)) {
     s.categories = [{ id: cid(), name: 'Canais de texto' }, { id: cid(), name: 'Canais de voz' }];
@@ -32,6 +38,8 @@ db.servers.forEach((s) => {
   }
 });
 db.members.forEach((m) => { if (!Array.isArray(m.role_ids)) m.role_ids = []; });
+Object.keys(EMPTY).forEach((k) => { if (!Array.isArray(db[k])) db[k] = []; });
+}
 
 let saveTimer = null;
 function save() {
@@ -42,13 +50,19 @@ function save() {
     fs.writeFileSync(tmp, JSON.stringify(db));
     fs.renameSync(tmp, DB_FILE);
   }, 150);
+  store?.saveDb(() => JSON.stringify(db));
 }
 function flushSync() {
   if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
   fs.writeFileSync(DB_FILE, JSON.stringify(db));
 }
-process.on('SIGINT', () => { flushSync(); process.exit(0); });
-process.on('SIGTERM', () => { flushSync(); process.exit(0); });
+async function shutdown() {
+  flushSync();
+  if (store) { try { await store.flush(() => JSON.stringify(db)); } catch (e) { console.error(e.message); } }
+  process.exit(0);
+}
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
 
 function id() { return crypto.randomBytes(12).toString('hex'); }
 function cid() { return crypto.randomBytes(6).toString('hex'); }
@@ -89,6 +103,11 @@ function canSee(c, uid) {
   if (permsOf(c.server_id, uid).admin) return true;
   const m = memberOf(c.server_id, uid);
   return c.allowed_roles.some((r) => m.role_ids.includes(r));
+}
+function canAttach(c, uid) {
+  const staff = permsOf(c.server_id, uid).manage_messages;
+  const a = c.allow || {};
+  return { images: staff || a.images !== false, files: staff || a.files !== false, audio: staff || a.audio !== false };
 }
 function canPost(c, uid) {
   return canSee(c, uid) && (!c.read_only || permsOf(c.server_id, uid).manage_messages);
@@ -177,7 +196,9 @@ function sanitizePlan(plan) {
       let n = str(ch?.name, 40);
       if (kind === 'text') n = n.toLowerCase().replace(/\s+/g, '-');
       if (!n) return;
-      cat.channels.push({ name: n, kind, read_only: !!ch.read_only, topic: str(ch.topic, 200) });
+      const item = { name: n, kind, read_only: !!ch.read_only, topic: str(ch.topic, 200) };
+      if (kind === 'text' && (ch.text_only || ch.allow)) item.allow = ch.text_only ? { images: false, files: false, audio: false } : { images: ch.allow.images !== false, files: ch.allow.files !== false, audio: ch.allow.audio !== false };
+      cat.channels.push(item);
       total++;
     });
     out.categories.push(cat);
@@ -191,6 +212,7 @@ function applyPlan(s, ownerId, rawPlan, { replace = false } = {}) {
   if (replace) {
     const chIds = db.channels.filter((c) => c.server_id === s.id).map((c) => c.id);
     for (const [, sock] of io.sockets.sockets) if (chIds.includes(sock.data.voice)) leaveVoice(sock);
+    removeUploads(attIds(db.messages.filter((m) => chIds.includes(m.channel_id))));
     db.messages = db.messages.filter((m) => !chIds.includes(m.channel_id));
     db.channels = db.channels.filter((c) => c.server_id !== s.id);
     db.roles = db.roles.filter((r) => r.server_id !== s.id);
@@ -228,6 +250,7 @@ function applyPlan(s, ownerId, rawPlan, { replace = false } = {}) {
       if (db.channels.some((c) => c.server_id === s.id && c.name === ch.name && c.kind === ch.kind)) return;
       const c = { id: id(), server_id: s.id, name: ch.name, kind: ch.kind, category_id: category.id, position: pos++,
         topic: ch.topic || '', read_only: ch.read_only, allowed_roles: cat.private && staffIds.length ? [...staffIds] : [], created_at: now() };
+      if (ch.allow) c.allow = ch.allow;
       db.channels.push(c); out.channels++;
       if (!rulesPosted && ch.kind === 'text' && /regra|rule/i.test(ch.name)) {
         db.messages.push({ id: id(), channel_id: c.id, server_id: s.id, author_id: ownerId, author_name: userById(ownerId)?.display_name || '', content: plan.rules, created_at: now() });
@@ -257,6 +280,7 @@ Regras:
 - Canais de texto: minúsculas, sem espaços (use hífen). Canais de voz podem ter espaços. kind é "text" ou "voice".
 - perms possíveis: admin, manage_server, manage_channels, manage_roles, manage_messages, kick.
 - Exatamente um cargo com "owner":true (o dono). Marque cargos de moderação com "staff":true. Marque no máximo um cargo com "default":true (dado automaticamente a quem entra; nunca admin).
+- Em canais de texto você pode usar "text_only":true (só texto, sem imagens/arquivos/áudios) ou "allow":{"images":true,"files":false,"audio":true}. Ex.: #geral só texto, #clipes e #prints com imagens.
 - Categorias com "private":true só a staff vê (use para área da staff). read_only:true em canais de avisos/regras (em voz: só a staff fala).
 - Inclua um canal de regras (nome com "regras") e escreva "rules" combinando com o tema.
 - Entre 3 e 8 categorias, no máximo 40 canais e 10 cargos. Cores em hexadecimal #rrggbb.`;
@@ -411,6 +435,90 @@ async function makePlan(prompt, useEmoji) {
 // ---------------------------------------------------------------- app
 const app = express();
 app.set('trust proxy', 1);
+
+// ---- anexos (imagens, arquivos, áudios)
+const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
+fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+const MAX_UPLOAD = Number(process.env.MAX_UPLOAD_MB || 8) * 1024 * 1024;
+function kindOf(type) {
+  if (/^image\/(png|jpe?g|gif|webp)$/.test(type)) return 'image';
+  if (/^audio\//.test(type)) return 'audio';
+  if (/^video\/(mp4|webm|quicktime)$/.test(type)) return 'video';
+  return 'file';
+}
+// qual permissão do canal cada tipo usa
+const ALLOW_KEY = { image: 'images', audio: 'audio', video: 'files', file: 'files' };
+const attachmentPayload = (u) => ({ id: u.id, name: u.name, type: u.type, size: u.size, kind: u.kind, url: `/files/${u.id}/${encodeURIComponent(u.name)}` });
+function removeUploads(ids) {
+  if (!ids.length) return;
+  const set = new Set(ids);
+  db.uploads = db.uploads.filter((u) => {
+    if (!set.has(u.id)) return true;
+    fs.unlink(path.join(UPLOAD_DIR, u.id), () => {});
+    store?.delFile(u.id).catch(() => {});
+    return false;
+  });
+}
+const attIds = (list) => list.flatMap((m) => (m.attachments || []).map((a) => a.id));
+app.post('/api/upload', auth, express.raw({ type: () => true, limit: MAX_UPLOAD }), async (req, res) => {
+  const buf = req.body;
+  if (!Buffer.isBuffer(buf) || !buf.length) return bad(res, 'Arquivo vazio.');
+  const type = String(req.headers['content-type'] || 'application/octet-stream').split(';')[0].trim().toLowerCase().slice(0, 100) || 'application/octet-stream';
+  let name = 'arquivo';
+  try { name = decodeURIComponent(String(req.headers['x-filename'] || 'arquivo')); } catch { /* usa padrão */ }
+  name = name.replace(/[\\/\0\r\n"]/g, '_').trim().slice(0, 120) || 'arquivo';
+  const u = { id: id(), user_id: req.user.id, name, type, size: buf.length, kind: kindOf(type), created_at: now(), used: false };
+  fs.writeFileSync(path.join(UPLOAD_DIR, u.id), buf);
+  if (store) {
+    try { await store.putFile(u.id, buf, type); } catch (e) { console.error('Falha ao guardar arquivo:', e.message); return bad(res, 'Não consegui guardar o arquivo. Tente de novo.', 500); }
+  }
+  db.uploads.push(u);
+  save();
+  res.json(attachmentPayload(u));
+});
+app.get('/files/:fid/:name?', async (req, res) => {
+  const u = db.uploads.find((x) => x.id === req.params.fid);
+  if (!u) return res.status(404).send('Arquivo não encontrado.');
+  const inline = u.kind !== 'file';
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Content-Security-Policy', "default-src 'none'; sandbox");
+  res.setHeader('Content-Type', inline ? u.type : 'application/octet-stream');
+  res.setHeader('Content-Disposition', `${inline ? 'inline' : 'attachment'}; filename*=UTF-8''${encodeURIComponent(u.name)}`);
+  res.setHeader('Cache-Control', 'private, max-age=31536000, immutable');
+  const local = path.join(UPLOAD_DIR, u.id);
+  if (!fs.existsSync(local) && store) {
+    try {
+      const buf = await store.getFile(u.id);
+      if (!buf) return res.status(404).end();
+      fs.writeFileSync(local, buf);
+    } catch { return res.status(503).end(); }
+  }
+  res.sendFile(local, (err) => { if (err && !res.headersSent) res.status(404).end(); });
+});
+// pega os anexos enviados por quem está mandando a mensagem
+function takeAttachments(req, res, allowFn) {
+  const ids = Array.isArray(req.body.attachments) ? req.body.attachments.slice(0, 10).map(String) : [];
+  const out = [];
+  for (const aid of ids) {
+    const u = db.uploads.find((x) => x.id === aid && x.user_id === req.user.id && !x.used);
+    if (!u) { bad(res, 'Um dos anexos não foi encontrado. Envie de novo.'); return null; }
+    const key = ALLOW_KEY[u.kind];
+    if (allowFn && !allowFn(key)) {
+      bad(res, { images: 'Este canal não aceita imagens.', audio: 'Este canal não aceita áudios.', files: 'Este canal não aceita arquivos.' }[key], 403);
+      return null;
+    }
+    out.push(u);
+  }
+  out.forEach((u) => { u.used = true; });
+  return out.map(attachmentPayload);
+}
+// limpa anexos enviados e nunca usados (mais de 1 dia)
+setInterval(() => {
+  const old = new Date(Date.now() - 864e5).toISOString();
+  removeUploads(db.uploads.filter((u) => !u.used && u.created_at < old).map((u) => u.id));
+  save();
+}, 3600e3).unref();
+
 app.use(express.json({ limit: '4mb' }));
 
 function parseCookies(header = '') {
@@ -574,6 +682,7 @@ app.patch('/api/servers/:sid', auth, (req, res) => {
 app.delete('/api/servers/:sid', auth, (req, res) => {
   const s = requireOwner(req, res); if (!s) return;
   const chIds = db.channels.filter((c) => c.server_id === s.id).map((c) => c.id);
+  removeUploads(attIds(db.messages.filter((m) => chIds.includes(m.channel_id))));
   db.messages = db.messages.filter((m) => !chIds.includes(m.channel_id));
   db.channels = db.channels.filter((c) => c.server_id !== s.id);
   db.members = db.members.filter((m) => m.server_id !== s.id);
@@ -761,6 +870,9 @@ function channelFields(body, s, c) {
   if (body.topic !== undefined) c.topic = cleanStr(body.topic, 200);
   if (body.read_only !== undefined) c.read_only = !!body.read_only;
   if (body.category_id !== undefined) c.category_id = s.categories.some((x) => x.id === body.category_id) ? body.category_id : null;
+  if (body.allow && typeof body.allow === 'object') {
+    c.allow = { images: body.allow.images !== false, files: body.allow.files !== false, audio: body.allow.audio !== false };
+  }
   if (body.allowed_roles !== undefined) {
     const valid = serverRoles(s.id).map((r) => r.id);
     c.allowed_roles = (Array.isArray(body.allowed_roles) ? body.allowed_roles : []).filter((r) => valid.includes(r));
@@ -771,7 +883,7 @@ app.get('/api/servers/:sid/channels', auth, (req, res) => {
   const s = requireMember(req, res); if (!s) return;
   res.json(db.channels.filter((c) => c.server_id === s.id && canSee(c, req.user.id))
     .sort((a, b) => (a.position || 0) - (b.position || 0))
-    .map((c) => ({ ...c, can_post: canPost(c, req.user.id) })));
+    .map((c) => ({ ...c, can_post: canPost(c, req.user.id), can_attach: canAttach(c, req.user.id) })));
 });
 app.post('/api/servers/:sid/channels', auth, (req, res) => {
   const s = requirePerm(req, res, 'manage_channels'); if (!s) return;
@@ -782,7 +894,7 @@ app.post('/api/servers/:sid/channels', auth, (req, res) => {
   if (err) return bad(res, err);
   db.channels.push(c);
   save(); refresh(s.id);
-  res.json({ ...c, can_post: canPost(c, req.user.id) });
+  res.json({ ...c, can_post: canPost(c, req.user.id), can_attach: canAttach(c, req.user.id) });
 });
 function requireChannel(req, res, perm) {
   const c = channelById(req.params.cid);
@@ -808,6 +920,7 @@ app.patch('/api/channels/:cid', auth, (req, res) => {
 app.delete('/api/channels/:cid', auth, (req, res) => {
   const c = requireChannel(req, res, 'manage_channels'); if (!c) return;
   db.channels = db.channels.filter((x) => x.id !== c.id);
+  removeUploads(attIds(db.messages.filter((m) => m.channel_id === c.id)));
   db.messages = db.messages.filter((m) => m.channel_id !== c.id);
   save();
   for (const [, sock] of io.sockets.sockets) if (sock.data.voice === c.id) leaveVoice(sock);
@@ -842,8 +955,10 @@ app.post('/api/channels/:cid/messages', auth, (req, res) => {
   if (hits.length >= 5) return bad(res, 'Calma! Você está enviando mensagens rápido demais.', 429);
   hits.push(t); rate.set(req.user.id, hits);
   const content = String(req.body.content || '').trim().slice(0, 2000);
-  if (!content) return bad(res, 'Mensagem vazia.');
-  const m = { id: id(), channel_id: c.id, server_id: c.server_id, author_id: req.user.id, author_name: req.user.display_name, content, created_at: now() };
+  const perm = canAttach(c, req.user.id);
+  const attachments = takeAttachments(req, res, (k) => perm[k]); if (!attachments) return;
+  if (!content && !attachments.length) return bad(res, 'Mensagem vazia.');
+  const m = { id: id(), channel_id: c.id, server_id: c.server_id, author_id: req.user.id, author_name: req.user.display_name, content, attachments, created_at: now() };
   db.messages.push(m);
   save();
   const p = messagePayload(m);
@@ -855,6 +970,7 @@ app.delete('/api/messages/:mid', auth, (req, res) => {
   if (!m) return bad(res, 'Mensagem não encontrada.', 404);
   if (m.author_id !== req.user.id && !permsOf(m.server_id, req.user.id).manage_messages) return bad(res, 'Sem permissão.', 403);
   db.messages = db.messages.filter((x) => x.id !== m.id);
+  removeUploads(attIds([m]));
   save();
   const c = channelById(m.channel_id);
   if (c) emitToChannel(c, 'message:deleted', { id: m.id, channel_id: m.channel_id });
@@ -875,7 +991,7 @@ function dmPayload(d, uid) {
   return {
     id: d.id, last_at: d.last_at,
     user: other ? { id: other.id, display_name: other.display_name, avatar_url: other.avatar_url || '', online: socketsOf(other.id).length > 0 } : { id: '', display_name: 'Conta removida', avatar_url: '' },
-    last_message: last ? { content: last.content.slice(0, 80), mine: last.author_id === uid } : null,
+    last_message: last ? { content: (last.content || (last.attachments?.length ? `📎 ${last.attachments[0].kind === 'audio' ? 'Áudio' : last.attachments[0].kind === 'image' ? 'Imagem' : 'Arquivo'}` : '')).slice(0, 80), mine: last.author_id === uid } : null,
     unread: msgs.filter((m) => m.author_id !== uid && m.created_at > read).length,
   };
 }
@@ -921,8 +1037,9 @@ app.post('/api/dms/:did/messages', auth, (req, res) => {
   if (hits.length >= 5) return bad(res, 'Calma! Você está enviando mensagens rápido demais.', 429);
   hits.push(t); rate.set(req.user.id, hits);
   const content = String(req.body.content || '').trim().slice(0, 2000);
-  if (!content) return bad(res, 'Mensagem vazia.');
-  const m = { id: id(), dm_id: d.id, author_id: req.user.id, content, created_at: now() };
+  const attachments = takeAttachments(req, res); if (!attachments) return;
+  if (!content && !attachments.length) return bad(res, 'Mensagem vazia.');
+  const m = { id: id(), dm_id: d.id, author_id: req.user.id, content, attachments, created_at: now() };
   db.dm_messages.push(m);
   d.last_at = m.created_at;
   d.read = d.read || {}; d.read[req.user.id] = m.created_at;
@@ -941,6 +1058,7 @@ app.delete('/api/dm-messages/:mid', auth, (req, res) => {
   const m = db.dm_messages.find((x) => x.id === req.params.mid);
   if (!m || m.author_id !== req.user.id) return bad(res, 'Mensagem não encontrada.', 404);
   db.dm_messages = db.dm_messages.filter((x) => x.id !== m.id);
+  removeUploads(attIds([m]));
   save();
   const d = dmById(m.dm_id);
   d?.user_ids.forEach((u) => io.to(`user:${u}`).emit('dm:deleted', { id: m.id, dm_id: m.dm_id }));
@@ -978,6 +1096,12 @@ app.get('/api/config', (req, res) => {
 // ---- front-end
 app.use(express.static(path.join(__dirname, 'public'), { etag: true, maxAge: 0 }));
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
+app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err);
+  if (err.type === 'entity.too.large') return bad(res, `Arquivo muito grande (máximo ${Math.round(MAX_UPLOAD / 1048576)} MB).`, 413);
+  console.error(err);
+  bad(res, 'Algo deu errado no servidor.', 500);
+});
 
 // ---------------------------------------------------------------- tempo real
 const server = http.createServer(app);
@@ -1065,4 +1189,19 @@ io.on('connection', (sock) => {
   sock.on('disconnect', () => leaveVoice(sock));
 });
 
-server.listen(PORT, () => console.log(`GlobalPath rodando em http://localhost:${PORT}`));
+(async () => {
+  if (store) {
+    try {
+      const remote = await store.loadDb();
+      if (remote) { db = { ...JSON.parse(JSON.stringify(EMPTY)), ...remote }; console.log('Banco carregado do MongoDB.'); }
+      else console.log('MongoDB conectado (banco novo).');
+    } catch (e) {
+      console.error('Não consegui conectar no MongoDB:', e.message);
+      console.error('Confira o MONGODB_URI e o acesso de rede (0.0.0.0/0) no Atlas. Parando para não perder dados.');
+      process.exit(1);
+    }
+  }
+  migrate();
+  if (store) store.saveDb(() => JSON.stringify(db), 0);
+  server.listen(PORT, () => console.log(`GlobalPath rodando em http://localhost:${PORT}`));
+})();

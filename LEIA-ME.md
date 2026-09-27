@@ -29,6 +29,15 @@ Para testar com amigos na mesma rede Wi-Fi, eles acessam `http://SEU-IP:3000`. M
 2. Em https://render.com → **New → Blueprint** → escolha o repositório (o arquivo `render.yaml` já configura tudo).
 3. Atenção: no plano grátis do Render o disco é temporário. Contas e mensagens **somem quando o app reinicia ou é atualizado**, e o app "dorme" depois de 15 minutos sem uso. Serve para testes; para uso sério, use a Railway com volume.
 
+## Guardar os dados de vez (MongoDB Atlas grátis)
+Sem isso, no Render grátis contas, mensagens e arquivos somem quando o site reinicia.
+1. Crie uma conta grátis em https://www.mongodb.com/cloud/atlas/register e crie um cluster **M0 (Free)** — de preferência na região **AWS Oregon (us-west-2)**, a mesma do Render.
+2. Crie um **usuário do banco** (nome e senha — use só letras e números na senha).
+3. Em **Network Access**, adicione `0.0.0.0/0` (Allow access from anywhere).
+4. Em **Connect → Drivers**, copie o link `mongodb+srv://...` e troque `<db_password>` pela senha.
+5. No Render: **Environment → Add Environment Variable** → `MONGODB_URI` = esse link → salvar.
+6. Nos **Logs** do Render deve aparecer "MongoDB conectado". Pronto: dados, fotos e áudios ficam salvos.
+
 ## Chamadas que não conectam
 As chamadas são diretas entre os navegadores (WebRTC). Na maioria das redes funciona só com o servidor STUN do Google, que já vem configurado. Em algumas redes (4G de algumas operadoras, redes de empresa), é preciso um servidor **TURN**. Dá para criar um grátis em https://www.metered.ca/stun-turn e colocar na variável `ICE_SERVERS`, por exemplo:
 
@@ -50,7 +59,8 @@ Opcional: `GEMINI_MODEL` ou `AI_MODEL` para escolher o modelo.
 - Perfil: nome de exibição e foto
 - Servidores: nome, cor, ícone; convidar por link; gerar novo link; membros online/offline; remover membro; sair; excluir
 - Canais de texto e de voz: criar, renomear, excluir (só o dono do servidor)
-- Chat em tempo real com links clicáveis, excluir mensagem e carregar mensagens antigas
+- Chat em tempo real com links clicáveis, imagens, arquivos, áudios e mensagens de voz (até 8 MB; `MAX_UPLOAD_MB` muda o limite)
+- Em cada canal a Staff escolhe o que pode ser enviado (imagens, arquivos, áudios) ou deixa só texto
 - Chamadas: microfone, silenciar áudio, câmera, compartilhar tela, tela cheia, indicador de quem está falando, lista de quem está na sala
 - Voz e vídeo: escolher microfone, saída de áudio e câmera, testar microfone e câmera, cancelamento de eco e supressão de ruído
 - Conversas privadas (mensagens diretas) com contador de não lidas
