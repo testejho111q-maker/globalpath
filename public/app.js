@@ -25,6 +25,7 @@ const ICONS = {
   headphones: '<path d="M3 18v-6a9 9 0 0 1 18 0v6"/><path d="M21 19a2 2 0 0 1-2 2h-1v-6h3zM3 19a2 2 0 0 0 2 2h1v-6H3z"/>',
   headOff: '<path d="m2 2 20 20"/><path d="M3 18v-6a9 9 0 0 1 14.5-7.1M21 12v6M21 19a2 2 0 0 1-2 2h-1v-3M3 19a2 2 0 0 0 2 2h1v-6H3z"/>',
   expand: '<path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/>',
+  shrink: '<path d="M4 14h6v6M20 10h-6V4M14 10l7-7M3 21l7-7"/>',
   x: '<path d="M18 6 6 18M6 6l12 12"/>',
   trash: '<path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6"/>',
   send: '<path d="m22 2-7 20-4-9-9-4z"/><path d="M22 2 11 13"/>',
@@ -566,7 +567,7 @@ function renderVoiceChannel(el, c) {
     return;
   }
   el.innerHTML = `<div class="main-head"></div>
-    <div class="call"><div class="call-grid" id="call-grid"></div><div class="call-alone" id="call-alone"></div>
+    <div class="call" id="call-root"><div class="call-grid" id="call-grid"></div><div class="call-alone" id="call-alone"></div>
     <div class="call-controls" id="call-controls"></div></div>`;
   renderHead();
   call.gridKey = null;
@@ -628,7 +629,8 @@ function leaveCall(silent) {
   call = null;
   if (!silent || socket?.connected) socket?.emit('voice:leave');
   c.peers.forEach((_, id) => closePeerOf(c, id));
-  [c.audioTrack, c.camTrack, c.screenTrack].forEach((t) => t?.stop());
+  [c.audioTrack, c.camTrack, c.screenTrack, c.screenAudioTrack].forEach((t) => t?.stop());
+  c.focusKey = null;
   clearInterval(c.speakTimer);
   speakers.clear();
   if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
@@ -638,23 +640,29 @@ function leaveCall(silent) {
 
 function createPeer(peerId, initiator) {
   const pc = new RTCPeerConnection({ iceServers: S.iceServers });
-  const peer = { pc, pending: [], audio: new MediaStream(), cam: new MediaStream(), screen: new MediaStream(), audioEl: null };
+  const peer = { pc, pending: [], audio: new MediaStream(), cam: new MediaStream(), screen: new MediaStream(), screenAudio: new MediaStream(), audioEl: null, screenAudioEl: null };
   call.peers.set(peerId, peer);
 
-  const el = document.createElement('audio');
-  el.autoplay = true; el.playsInline = true; el.srcObject = peer.audio; el.muted = call.deafened;
-  const sink = callSettings().speakerId;
-  if (sink && el.setSinkId) el.setSinkId(sink).catch(() => {});
-  document.body.appendChild(el);
+  const mkAudio = (stream) => {
+    const a = document.createElement('audio');
+    a.autoplay = true; a.playsInline = true; a.srcObject = stream; a.muted = call.deafened;
+    const sink = callSettings().speakerId;
+    if (sink && a.setSinkId) a.setSinkId(sink).catch(() => {});
+    document.body.appendChild(a);
+    return a;
+  };
+  const el = mkAudio(peer.audio);
   peer.audioEl = el;
+  peer.screenAudioEl = mkAudio(peer.screenAudio);
 
   pc.onicecandidate = (e) => { if (e.candidate) socket.emit('rtc:signal', { to: peerId, data: { candidate: e.candidate } }); };
   pc.ontrack = (e) => {
     const idx = pc.getTransceivers().indexOf(e.transceiver);
-    const target = idx === 0 ? peer.audio : idx === 1 ? peer.cam : peer.screen;
+    const target = [peer.audio, peer.cam, peer.screen, peer.screenAudio][idx] || peer.screen;
     target.getTracks().forEach((t) => target.removeTrack(t));
     target.addTrack(e.track);
     if (idx === 0) { el.play().catch(() => {}); watchSpeaking(peerId, peer.audio); }
+    if (idx === 3) peer.screenAudioEl.play().catch(() => {});
     call && (call.gridKey = null, updateCallGrid());
   };
   pc.onconnectionstatechange = () => {
@@ -664,6 +672,7 @@ function createPeer(peerId, initiator) {
     pc.addTransceiver('audio', { direction: 'sendrecv' });
     pc.addTransceiver('video', { direction: 'sendrecv' });
     pc.addTransceiver('video', { direction: 'sendrecv' });
+    pc.addTransceiver('audio', { direction: 'sendrecv' }); // som da transmissão
     applyTracks(peer);
     makeOffer(peerId);
   }
@@ -683,6 +692,7 @@ function applyTracks(peer) {
   t[0].sender.replaceTrack(call.audioTrack || null).catch(() => {});
   t[1].sender.replaceTrack(call.camTrack || null).catch(() => {});
   t[2].sender.replaceTrack(call.screenTrack || null).catch(() => {});
+  t[3]?.sender.replaceTrack(call.screenAudioTrack || null).catch(() => {});
 }
 async function onSignal({ from, data }) {
   if (!call) return;
@@ -710,6 +720,7 @@ function closePeerOf(c, id) {
   const peer = c.peers.get(id); if (!peer) return;
   peer.pc.close();
   peer.audioEl?.remove();
+  peer.screenAudioEl?.remove();
   c.peers.delete(id);
   speakers.delete(id);
 }
@@ -734,7 +745,7 @@ function toggleMute() {
   socket.emit('voice:update', { muted: call.muted, deafened: call.deafened });
   renderControls(); renderSidebar();
 }
-function applyDeafen() { call.peers.forEach((p) => { if (p.audioEl) p.audioEl.muted = call.deafened; }); }
+function applyDeafen() { call.peers.forEach((p) => { if (p.audioEl) p.audioEl.muted = call.deafened; if (p.screenAudioEl) p.screenAudioEl.muted = call.deafened; }); }
 function toggleDeafen() {
   if (!call) return;
   call.deafened = !call.deafened;
@@ -765,11 +776,18 @@ async function toggleScreen() {
   if (!call) return;
   if (call.screenTrack) {
     call.screenTrack.stop(); call.screenTrack = null;
+    call.screenAudioTrack?.stop(); call.screenAudioTrack = null;
   } else {
     try {
-      const st = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 30 }, audio: false });
+      const st = await navigator.mediaDevices.getDisplayMedia({
+        video: { frameRate: 30 },
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+        systemAudio: 'include', selfBrowserSurface: 'exclude',
+      });
       if (!call) return st.getTracks().forEach((t) => t.stop());
       call.screenTrack = st.getVideoTracks()[0];
+      call.screenAudioTrack = st.getAudioTracks()[0] || null;
+      if (!call.screenAudioTrack) toast('Transmitindo sem som. Para ter áudio, marque "Compartilhar áudio" ao escolher a tela ou aba.');
       call.screenTrack.contentHint = 'detail';
       call.screenTrack.onended = () => { if (call?.screenTrack) toggleScreen(); };
     } catch { return; }
@@ -794,20 +812,25 @@ function updateCallGrid() {
     if (scrOn) tiles.push({ key: p.socket_id + ':s', p, kind: 'screen', mine });
     tiles.push({ key: p.socket_id + ':c', p, kind: camOn ? 'cam' : 'avatar', mine });
   });
-  const key = tiles.map((t) => t.key + t.kind + t.p.muted + t.p.display_name + t.p.avatar_url).join('|');
+  // modo foco (tela cheia): mostra só o bloco escolhido
+  if (call.focusKey && !tiles.some((t) => t.key === call.focusKey)) exitFocus(true);
+  const shown = call.focusKey ? tiles.filter((t) => t.key === call.focusKey) : tiles.slice();
+  grid.classList.toggle('focus', !!call.focusKey);
+  const key = (call.focusKey || '') + shown.map((t) => t.key + t.kind + t.p.muted + t.p.display_name + t.p.avatar_url).join('|');
   $('#call-alone').textContent = parts.length <= 1 ? 'Você está sozinho aqui. Chame seus amigos para este canal.' : '';
   if (key === call.gridKey) return;
   call.gridKey = key;
+  tiles.length = 0; tiles.push(...shown);
   const n = tiles.length;
   const cols = n <= 1 ? 1 : n <= 4 ? 2 : n <= 9 ? 3 : 4;
   grid.style.gridTemplateColumns = window.innerWidth <= 600 && n > 1 ? '1fr' : `repeat(${cols}, minmax(0, 1fr))`;
-  grid.style.maxWidth = n <= 1 ? '960px' : '';
+  grid.style.maxWidth = n <= 1 && !call.focusKey ? '960px' : '';
   grid.style.margin = '0 auto'; grid.style.width = '100%';
   grid.innerHTML = tiles.map((t) => `
     <div class="tile ${t.kind === 'screen' ? 'screen' : ''} ${t.mine && t.kind === 'cam' ? 'mirror' : ''}" data-sock="${t.kind === 'screen' ? '' : (t.mine ? 'local' : t.p.socket_id)}" data-key="${t.key}">
       ${t.kind === 'avatar' ? avatarHtml(t.p) : '<video autoplay playsinline muted></video>'}
       <div class="label">${t.p.muted ? `<span class="red">${icon('micOff')}</span>` : icon('mic')}${esc(t.p.display_name)}${t.mine ? ' (você)' : ''}${t.kind === 'screen' ? ' — tela' : ''}</div>
-      <button class="icon-btn fs" title="Tela cheia">${icon('expand')}</button>
+      <button class="icon-btn fs" title="${call.focusKey ? 'Sair da tela cheia' : 'Tela cheia'}">${icon(call.focusKey ? 'shrink' : 'expand')}</button>
     </div>`).join('');
   tiles.forEach((t) => {
     const tile = grid.querySelector(`[data-key="${CSS.escape(t.key)}"]`);
@@ -817,12 +840,32 @@ function updateCallGrid() {
       else { const peer = call.peers.get(t.p.socket_id); v.srcObject = t.kind === 'screen' ? peer.screen : peer.cam; }
       v.play().catch(() => {});
     }
-    tile.querySelector('.fs').onclick = () => {
-      if (document.fullscreenElement) document.exitFullscreen();
-      else (tile.requestFullscreen || tile.webkitRequestFullscreen)?.call(tile);
-    };
+    const toggle = () => (call.focusKey ? exitFocus() : enterFocus(t.key));
+    tile.querySelector('.fs').onclick = (e) => { e.stopPropagation(); toggle(); };
+    tile.ondblclick = toggle;
   });
 }
+
+// tela cheia: o container da chamada fica em tela cheia (não é recriado),
+// e a grade mostra só o bloco escolhido — assim nada tira da tela cheia.
+function enterFocus(key) {
+  if (!call) return;
+  call.focusKey = key; call.gridKey = null;
+  updateCallGrid();
+  const root = $('#call-root');
+  if (root && !document.fullscreenElement) (root.requestFullscreen || root.webkitRequestFullscreen)?.call(root)?.catch?.(() => {});
+  // garante que o som da transmissão toque
+  call.peers.forEach((p) => { p.screenAudioEl?.play().catch(() => {}); p.audioEl?.play().catch(() => {}); });
+}
+function exitFocus(fromGrid) {
+  if (!call) return;
+  call.focusKey = null; call.gridKey = null;
+  if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+  if (!fromGrid) updateCallGrid();
+}
+document.addEventListener('fullscreenchange', () => {
+  if (!document.fullscreenElement && call?.focusKey) { call.focusKey = null; call.gridKey = null; updateCallGrid(); }
+});
 
 // indicador de quem está falando
 const speakers = new Map();
