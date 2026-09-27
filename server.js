@@ -14,13 +14,25 @@ const SESSION_DAYS = 30;
 
 // ---------------------------------------------------------------- banco
 fs.mkdirSync(DATA_DIR, { recursive: true });
-const EMPTY = { users: [], sessions: [], servers: [], members: [], channels: [], messages: [] };
-let db = EMPTY;
+const EMPTY = { users: [], sessions: [], servers: [], members: [], channels: [], messages: [], roles: [] };
+let db;
 try {
-  db = { ...EMPTY, ...JSON.parse(fs.readFileSync(DB_FILE, 'utf8')) };
+  db = { ...JSON.parse(JSON.stringify(EMPTY)), ...JSON.parse(fs.readFileSync(DB_FILE, 'utf8')) };
 } catch {
   db = JSON.parse(JSON.stringify(EMPTY));
 }
+// migração de dados antigos
+db.servers.forEach((s) => {
+  if (!Array.isArray(s.categories)) {
+    s.categories = [{ id: cid(), name: 'Canais de texto' }, { id: cid(), name: 'Canais de voz' }];
+    db.channels.filter((c) => c.server_id === s.id).forEach((c, i) => {
+      c.category_id = c.kind === 'voice' ? s.categories[1].id : s.categories[0].id;
+      c.position = i;
+    });
+  }
+});
+db.members.forEach((m) => { if (!Array.isArray(m.role_ids)) m.role_ids = []; });
+
 let saveTimer = null;
 function save() {
   if (saveTimer) return;
@@ -38,28 +50,157 @@ function flushSync() {
 process.on('SIGINT', () => { flushSync(); process.exit(0); });
 process.on('SIGTERM', () => { flushSync(); process.exit(0); });
 
-const id = () => crypto.randomBytes(12).toString('hex');
+function id() { return crypto.randomBytes(12).toString('hex'); }
+function cid() { return crypto.randomBytes(6).toString('hex'); }
 const now = () => new Date().toISOString();
 const inviteCode = () => crypto.randomBytes(5).toString('base64url').replace(/[-_]/g, 'x').slice(0, 8);
 
 function hashPassword(pw, salt = crypto.randomBytes(16).toString('hex')) {
-  const hash = crypto.scryptSync(pw, salt, 64).toString('hex');
-  return `${salt}:${hash}`;
+  return `${salt}:${crypto.scryptSync(pw, salt, 64).toString('hex')}`;
 }
 function checkPassword(pw, stored) {
   const [salt, hash] = stored.split(':');
-  const test = crypto.scryptSync(pw, salt, 64);
-  return crypto.timingSafeEqual(test, Buffer.from(hash, 'hex'));
+  return crypto.timingSafeEqual(crypto.scryptSync(pw, salt, 64), Buffer.from(hash, 'hex'));
 }
 
 const publicUser = (u) => u && ({ id: u.id, display_name: u.display_name, avatar_url: u.avatar_url || '', email: u.email });
 const userById = (uid) => db.users.find((u) => u.id === uid);
-const isMember = (sid, uid) => db.members.some((m) => m.server_id === sid && m.user_id === uid);
+const memberOf = (sid, uid) => db.members.find((m) => m.server_id === sid && m.user_id === uid);
+const isMember = (sid, uid) => !!memberOf(sid, uid);
 const serverById = (sid) => db.servers.find((s) => s.id === sid);
-const channelById = (cid) => db.channels.find((c) => c.id === cid);
+const channelById = (x) => db.channels.find((c) => c.id === x);
+const serverRoles = (sid) => db.roles.filter((r) => r.server_id === sid).sort((a, b) => a.position - b.position);
+
+// ---------------------------------------------------------------- permissões
+const PERMS = ['admin', 'manage_server', 'manage_channels', 'manage_roles', 'manage_messages', 'kick'];
+const ALL = Object.fromEntries(PERMS.map((p) => [p, true]));
+function permsOf(sid, uid) {
+  const s = serverById(sid);
+  const m = memberOf(sid, uid);
+  if (!s || !m) return Object.fromEntries(PERMS.map((p) => [p, false]));
+  if (s.owner_id === uid) return { ...ALL };
+  const p = Object.fromEntries(PERMS.map((k) => [k, false]));
+  serverRoles(sid).filter((r) => m.role_ids.includes(r.id)).forEach((r) => PERMS.forEach((k) => { if (r.perms?.[k]) p[k] = true; }));
+  return p.admin ? { ...ALL } : p;
+}
+function canSee(c, uid) {
+  if (!c || !isMember(c.server_id, uid)) return false;
+  if (!c.allowed_roles?.length) return true;
+  if (permsOf(c.server_id, uid).admin) return true;
+  const m = memberOf(c.server_id, uid);
+  return c.allowed_roles.some((r) => m.role_ids.includes(r));
+}
+function canPost(c, uid) {
+  return canSee(c, uid) && (!c.read_only || permsOf(c.server_id, uid).manage_messages);
+}
+// cor e cargo em destaque de um membro (o cargo mais alto que tem cor)
+function topRole(sid, uid) {
+  const m = memberOf(sid, uid); if (!m) return null;
+  return serverRoles(sid).find((r) => m.role_ids.includes(r.id) && r.color) || null;
+}
+
+// ---------------------------------------------------------------- modelo de servidor
+const STREAMER_TEMPLATE = {
+  roles: [
+    { key: 'dono', name: '👑 Dono', color: '#ef4444', hoist: true, perms: { admin: true } },
+    { key: 'staff', name: '🛡️ Staff', color: '#f97316', hoist: true, perms: { manage_messages: true, kick: true, manage_channels: true } },
+    { key: 'parceiro', name: '🎥 Parceiro', color: '#a855f7', hoist: true, perms: {} },
+    { key: 'vip', name: '⭐ VIP', color: '#eab308', hoist: true, perms: {} },
+    { key: 'inscrito', name: '🎮 Inscrito', color: '#22c55e', hoist: false, perms: {} },
+    { key: 'bots', name: '🤖 Bots', color: '#9ca3af', hoist: false, perms: {} },
+  ],
+  categories: [
+    { name: '📌 Informações', channels: [
+      { name: '📜regras', kind: 'text', read_only: true, topic: 'Leia antes de participar.' },
+      { name: '📢avisos', kind: 'text', read_only: true, topic: 'Novidades do canal e do servidor.' },
+      { name: '🎬videos-novos', kind: 'text', read_only: true, topic: 'Todo vídeo novo aparece aqui.' },
+      { name: '🔴ao-vivo', kind: 'text', read_only: true, topic: 'Aviso de live.' },
+    ] },
+    { name: '💬 Comunidade', channels: [
+      { name: '💬geral', kind: 'text', topic: 'Bate-papo livre.' },
+      { name: '🎮clipes', kind: 'text', topic: 'Mande seus melhores clipes.' },
+      { name: '😂memes', kind: 'text' },
+      { name: '📸prints', kind: 'text' },
+      { name: '💡sugestões', kind: 'text', topic: 'Ideias de vídeo e melhorias para o servidor.' },
+    ] },
+    { name: '🎮 Jogos', channels: [
+      { name: 'gta-rp', kind: 'text' },
+      { name: 'free-fire', kind: 'text' },
+      { name: 'procurando-duo', kind: 'text', topic: 'Ache alguém para jogar.' },
+    ] },
+    { name: '🔊 Voz', channels: [
+      { name: '🔊 Geral', kind: 'voice' },
+      { name: '🎮 Jogando 1', kind: 'voice' },
+      { name: '🎮 Jogando 2', kind: 'voice' },
+      { name: '🎥 Live do jh11', kind: 'voice', read_only: true },
+      { name: '💤 AFK', kind: 'voice' },
+    ] },
+    { name: '🛡️ Staff', staff: true, channels: [
+      { name: 'staff-chat', kind: 'text' },
+      { name: '🔊 Reunião Staff', kind: 'voice' },
+    ] },
+  ],
+  rules: [
+    '📜 **Regras do servidor**',
+    '',
+    '1. Respeito acima de tudo — sem ofensas, preconceito ou assédio.',
+    '2. Nada de spam, flood ou divulgação sem permissão da Staff.',
+    '3. Conteúdo +18, violento ou ilegal é proibido.',
+    '4. Use cada canal para o assunto certo.',
+    '5. Não peça cargo — a Staff dá cargo para quem ajuda a comunidade.',
+    '6. Siga as orientações da Staff.',
+    '',
+    'Quem quebrar as regras pode levar castigo, expulsão ou banimento. Bora jogar! 🎮',
+  ].join('\n'),
+};
+
+function applyTemplate(s, ownerId) {
+  const out = { roles: 0, channels: 0, categories: 0 };
+  const base = serverRoles(s.id).length;
+  const roleIds = {};
+  STREAMER_TEMPLATE.roles.forEach((r, i) => {
+    let role = db.roles.find((x) => x.server_id === s.id && x.name === r.name);
+    if (!role) {
+      role = { id: id(), server_id: s.id, name: r.name, color: r.color, hoist: r.hoist, perms: { ...r.perms }, position: base + i };
+      db.roles.push(role); out.roles++;
+    }
+    roleIds[r.key] = role.id;
+  });
+  const owner = memberOf(s.id, ownerId);
+  if (owner && !owner.role_ids.includes(roleIds.dono)) owner.role_ids.push(roleIds.dono);
+  if (!s.default_role_id) {
+    s.default_role_id = roleIds.inscrito;
+    db.members.filter((m) => m.server_id === s.id && m.user_id !== ownerId).forEach((m) => {
+      if (!m.role_ids.includes(roleIds.inscrito)) m.role_ids.push(roleIds.inscrito);
+    });
+  }
+  let pos = Math.max(0, ...db.channels.filter((c) => c.server_id === s.id).map((c) => c.position || 0)) + 1;
+  STREAMER_TEMPLATE.categories.forEach((cat) => {
+    let category = s.categories.find((c) => c.name === cat.name);
+    if (!category) { category = { id: cid(), name: cat.name }; s.categories.push(category); out.categories++; }
+    cat.channels.forEach((ch) => {
+      if (db.channels.some((c) => c.server_id === s.id && c.name === ch.name && c.kind === ch.kind)) return;
+      const c = { id: id(), server_id: s.id, name: ch.name, kind: ch.kind, category_id: category.id, position: pos++,
+        topic: ch.topic || '', read_only: !!ch.read_only, allowed_roles: cat.staff ? [roleIds.staff, roleIds.dono] : [], created_at: now() };
+      db.channels.push(c); out.channels++;
+      if (ch.name === '📜regras') {
+        db.messages.push({ id: id(), channel_id: c.id, server_id: s.id, author_id: ownerId, author_name: userById(ownerId)?.display_name || '', content: STREAMER_TEMPLATE.rules, created_at: now() });
+      }
+    });
+  });
+  // move as categorias do modelo para o topo, na ordem certa
+  const names = STREAMER_TEMPLATE.categories.map((c) => c.name);
+  s.categories.sort((a, b) => {
+    const ia = names.indexOf(a.name), ib = names.indexOf(b.name);
+    return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+  });
+  save();
+  return out;
+}
 
 // ---------------------------------------------------------------- app
 const app = express();
+app.set('trust proxy', 1);
 app.use(express.json({ limit: '4mb' }));
 
 function parseCookies(header = '') {
@@ -77,12 +218,12 @@ function userFromCookie(header) {
   if (!s || new Date(s.expires) < new Date()) return null;
   return userById(s.user_id) || null;
 }
-function setSession(res, userId) {
+function setSession(req, res, userId) {
   const token = crypto.randomBytes(32).toString('hex');
   const expires = new Date(Date.now() + SESSION_DAYS * 864e5);
   db.sessions.push({ token, user_id: userId, expires: expires.toISOString() });
   save();
-  const secure = process.env.NODE_ENV === 'production' ? '; Secure' : '';
+  const secure = req.secure ? '; Secure' : '';
   res.setHeader('Set-Cookie', `${COOKIE}=${token}; HttpOnly; Path=/; SameSite=Lax; Expires=${expires.toUTCString()}${secure}`);
 }
 function auth(req, res, next) {
@@ -94,6 +235,7 @@ function auth(req, res, next) {
 const bad = (res, msg, code = 400) => res.status(code).json({ error: msg });
 const cleanStr = (v, max) => String(v ?? '').trim().slice(0, max);
 const validImage = (v) => !v || (typeof v === 'string' && /^data:image\/(png|jpe?g|webp|gif);base64,/.test(v) && v.length < 1_500_000);
+const validColor = (v) => /^#[0-9a-f]{6}$/i.test(String(v || ''));
 
 // ---- auth
 app.post('/api/auth/register', (req, res) => {
@@ -106,18 +248,16 @@ app.post('/api/auth/register', (req, res) => {
   if (db.users.some((u) => u.email === email)) return bad(res, 'Este e-mail já está cadastrado.');
   const user = { id: id(), email, display_name, avatar_url: '', password: hashPassword(password), created_at: now() };
   db.users.push(user);
-  setSession(res, user.id);
+  setSession(req, res, user.id);
   res.json(publicUser(user));
 });
-
 app.post('/api/auth/login', (req, res) => {
   const email = cleanStr(req.body.email, 120).toLowerCase();
   const user = db.users.find((u) => u.email === email);
   if (!user || !checkPassword(String(req.body.password || ''), user.password)) return bad(res, 'E-mail ou senha incorretos.', 401);
-  setSession(res, user.id);
+  setSession(req, res, user.id);
   res.json(publicUser(user));
 });
-
 app.post('/api/auth/logout', (req, res) => {
   const token = parseCookies(req.headers.cookie)[COOKIE];
   db.sessions = db.sessions.filter((s) => s.token !== token);
@@ -125,9 +265,7 @@ app.post('/api/auth/logout', (req, res) => {
   res.setHeader('Set-Cookie', `${COOKIE}=; HttpOnly; Path=/; Max-Age=0`);
   res.json({ ok: true });
 });
-
 app.get('/api/me', auth, (req, res) => res.json(publicUser(req.user)));
-
 app.patch('/api/me', auth, (req, res) => {
   const { display_name, avatar_url } = req.body;
   if (display_name !== undefined) {
@@ -141,11 +279,9 @@ app.patch('/api/me', auth, (req, res) => {
   }
   save();
   const pu = publicUser(req.user);
-  // avisa todos os servidores em que a pessoa está
-  db.members.filter((m) => m.user_id === req.user.id).forEach((m) => io.to(`server:${m.server_id}`).emit('user:updated', pu));
+  db.members.filter((m) => m.user_id === req.user.id).forEach((m) => io.to(`server:${m.server_id}`).emit('user:updated', { ...pu, email: undefined }));
   res.json(pu);
 });
-
 app.post('/api/me/password', auth, (req, res) => {
   const { current, next } = req.body;
   if (!checkPassword(String(current || ''), req.user.password)) return bad(res, 'Senha atual incorreta.');
@@ -157,23 +293,30 @@ app.post('/api/me/password', auth, (req, res) => {
 
 // ---- servidores
 function serverPayload(s, uid) {
-  return { ...s, is_owner: s.owner_id === uid };
+  return { id: s.id, name: s.name, color: s.color, icon_url: s.icon_url, invite_code: s.invite_code, owner_id: s.owner_id,
+    categories: s.categories, default_role_id: s.default_role_id || null, is_owner: s.owner_id === uid, perms: permsOf(s.id, uid) };
 }
+function refresh(sid) { io.to(`server:${sid}`).emit('server:refresh', { server_id: sid }); }
+
 app.get('/api/servers', auth, (req, res) => {
   const ids = db.members.filter((m) => m.user_id === req.user.id).map((m) => m.server_id);
   res.json(db.servers.filter((s) => ids.includes(s.id)).map((s) => serverPayload(s, req.user.id)));
 });
-
 app.post('/api/servers', auth, (req, res) => {
   const name = cleanStr(req.body.name, 40);
   if (!name) return bad(res, 'Dê um nome ao servidor.');
   if (!validImage(req.body.icon_url)) return bad(res, 'Ícone inválido ou muito grande.');
   const color = /^(10|[1-9])$/.test(String(req.body.color)) ? String(req.body.color) : String(1 + Math.floor(Math.random() * 10));
-  const s = { id: id(), name, color, icon_url: req.body.icon_url || '', invite_code: inviteCode(), owner_id: req.user.id, created_at: now() };
+  const s = { id: id(), name, color, icon_url: req.body.icon_url || '', invite_code: inviteCode(), owner_id: req.user.id, created_at: now(), categories: [] };
   db.servers.push(s);
-  db.members.push({ id: id(), server_id: s.id, user_id: req.user.id, joined_at: now() });
-  db.channels.push({ id: id(), server_id: s.id, name: 'geral', kind: 'text', created_at: now() });
-  db.channels.push({ id: id(), server_id: s.id, name: 'Sala de voz', kind: 'voice', created_at: now() });
+  db.members.push({ id: id(), server_id: s.id, user_id: req.user.id, role_ids: [], joined_at: now() });
+  if (req.body.template === 'streamer') {
+    applyTemplate(s, req.user.id);
+  } else {
+    s.categories = [{ id: cid(), name: 'Canais de texto' }, { id: cid(), name: 'Canais de voz' }];
+    db.channels.push({ id: id(), server_id: s.id, name: 'geral', kind: 'text', category_id: s.categories[0].id, position: 0, topic: '', read_only: false, allowed_roles: [], created_at: now() });
+    db.channels.push({ id: id(), server_id: s.id, name: 'Sala de voz', kind: 'voice', category_id: s.categories[1].id, position: 1, topic: '', read_only: false, allowed_roles: [], created_at: now() });
+  }
   save();
   joinSocketsToServer(req.user.id, s.id);
   res.json(serverPayload(s, req.user.id));
@@ -184,6 +327,12 @@ function requireMember(req, res) {
   if (!s || !isMember(s.id, req.user.id)) { bad(res, 'Servidor não encontrado.', 404); return null; }
   return s;
 }
+function requirePerm(req, res, perm) {
+  const s = requireMember(req, res);
+  if (!s) return null;
+  if (!permsOf(s.id, req.user.id)[perm]) { bad(res, 'Você não tem permissão para fazer isso.', 403); return null; }
+  return s;
+}
 function requireOwner(req, res) {
   const s = requireMember(req, res);
   if (!s) return null;
@@ -191,49 +340,56 @@ function requireOwner(req, res) {
   return s;
 }
 
+app.get('/api/servers/:sid', auth, (req, res) => {
+  const s = requireMember(req, res); if (!s) return;
+  res.json(serverPayload(s, req.user.id));
+});
 app.patch('/api/servers/:sid', auth, (req, res) => {
-  const s = requireOwner(req, res); if (!s) return;
-  if (req.body.name !== undefined) {
-    const n = cleanStr(req.body.name, 40); if (!n) return bad(res, 'Nome inválido.'); s.name = n;
-  }
+  const s = requirePerm(req, res, 'manage_server'); if (!s) return;
+  if (req.body.name !== undefined) { const n = cleanStr(req.body.name, 40); if (!n) return bad(res, 'Nome inválido.'); s.name = n; }
   if (req.body.color !== undefined && /^(10|[1-9])$/.test(String(req.body.color))) s.color = String(req.body.color);
   if (req.body.icon_url !== undefined) {
     if (!validImage(req.body.icon_url)) return bad(res, 'Ícone inválido ou muito grande.');
     s.icon_url = req.body.icon_url || '';
   }
-  save();
-  io.to(`server:${s.id}`).emit('server:updated', s);
+  if (req.body.default_role_id !== undefined) {
+    const r = req.body.default_role_id;
+    s.default_role_id = r && db.roles.some((x) => x.id === r && x.server_id === s.id) ? r : null;
+  }
+  save(); refresh(s.id);
   res.json(serverPayload(s, req.user.id));
 });
-
 app.delete('/api/servers/:sid', auth, (req, res) => {
   const s = requireOwner(req, res); if (!s) return;
   const chIds = db.channels.filter((c) => c.server_id === s.id).map((c) => c.id);
   db.messages = db.messages.filter((m) => !chIds.includes(m.channel_id));
   db.channels = db.channels.filter((c) => c.server_id !== s.id);
   db.members = db.members.filter((m) => m.server_id !== s.id);
+  db.roles = db.roles.filter((r) => r.server_id !== s.id);
   db.servers = db.servers.filter((x) => x.id !== s.id);
   save();
   io.to(`server:${s.id}`).emit('server:deleted', { id: s.id });
   io.in(`server:${s.id}`).socketsLeave(`server:${s.id}`);
   res.json({ ok: true });
 });
-
-app.post('/api/servers/:sid/invite', auth, (req, res) => {
+app.post('/api/servers/:sid/template', auth, (req, res) => {
   const s = requireOwner(req, res); if (!s) return;
+  const out = applyTemplate(s, req.user.id);
+  refresh(s.id);
+  res.json(out);
+});
+app.post('/api/servers/:sid/invite', auth, (req, res) => {
+  const s = requirePerm(req, res, 'manage_server'); if (!s) return;
   s.invite_code = inviteCode();
-  save();
-  io.to(`server:${s.id}`).emit('server:updated', s);
+  save(); refresh(s.id);
   res.json(serverPayload(s, req.user.id));
 });
-
 app.post('/api/servers/:sid/leave', auth, (req, res) => {
   const s = requireMember(req, res); if (!s) return;
   if (s.owner_id === req.user.id) return bad(res, 'O dono não pode sair — exclua o servidor nas configurações.');
   removeMember(s.id, req.user.id);
   res.json({ ok: true });
 });
-
 function removeMember(sid, uid) {
   db.members = db.members.filter((m) => !(m.server_id === sid && m.user_id === uid));
   save();
@@ -244,20 +400,232 @@ function removeMember(sid, uid) {
   }
   io.to(`user:${uid}`).emit('server:removed', { id: sid });
 }
-
 app.get('/api/servers/:sid/members', auth, (req, res) => {
   const s = requireMember(req, res); if (!s) return;
-  const list = db.members.filter((m) => m.server_id === s.id).map((m) => ({
-    ...publicUser(userById(m.user_id)), email: undefined, joined_at: m.joined_at, is_owner: m.user_id === s.owner_id,
-    online: socketsOf(m.user_id).length > 0,
-  })).filter((m) => m.id);
-  res.json(list);
+  res.json(db.members.filter((m) => m.server_id === s.id).map((m) => {
+    const u = userById(m.user_id); if (!u) return null;
+    return { id: u.id, display_name: u.display_name, avatar_url: u.avatar_url || '', joined_at: m.joined_at, role_ids: m.role_ids,
+      is_owner: m.user_id === s.owner_id, online: socketsOf(m.user_id).length > 0, color: topRole(s.id, u.id)?.color || '' };
+  }).filter(Boolean));
+});
+app.delete('/api/servers/:sid/members/:uid', auth, (req, res) => {
+  const s = requirePerm(req, res, 'kick'); if (!s) return;
+  if (req.params.uid === s.owner_id) return bad(res, 'O dono não pode ser removido.');
+  if (req.params.uid === req.user.id) return bad(res, 'Use "Sair do servidor".');
+  if (permsOf(s.id, req.params.uid).admin && s.owner_id !== req.user.id) return bad(res, 'Só o dono pode remover um administrador.', 403);
+  removeMember(s.id, req.params.uid);
+  res.json({ ok: true });
+});
+app.put('/api/servers/:sid/members/:uid/roles', auth, (req, res) => {
+  const s = requirePerm(req, res, 'manage_roles'); if (!s) return;
+  const m = memberOf(s.id, req.params.uid);
+  if (!m) return bad(res, 'Membro não encontrado.', 404);
+  const valid = serverRoles(s.id).map((r) => r.id);
+  const want = (Array.isArray(req.body.role_ids) ? req.body.role_ids : []).filter((r) => valid.includes(r));
+  const me = permsOf(s.id, req.user.id);
+  // quem não é administrador não pode dar nem tirar cargos de administrador
+  if (!me.admin) {
+    const adminRoles = serverRoles(s.id).filter((r) => r.perms?.admin).map((r) => r.id);
+    const changed = [...new Set([...want, ...m.role_ids])].filter((r) => want.includes(r) !== m.role_ids.includes(r));
+    if (changed.some((r) => adminRoles.includes(r))) return bad(res, 'Só administradores mexem em cargos de administrador.', 403);
+  }
+  m.role_ids = want;
+  save(); refresh(s.id);
+  res.json({ ok: true });
 });
 
-app.delete('/api/servers/:sid/members/:uid', auth, (req, res) => {
-  const s = requireOwner(req, res); if (!s) return;
-  if (req.params.uid === s.owner_id) return bad(res, 'Você não pode remover a si mesmo.');
-  removeMember(s.id, req.params.uid);
+// ---- cargos
+function cleanPerms(p = {}, allowAdmin) {
+  const out = {};
+  PERMS.forEach((k) => { out[k] = !!p[k]; });
+  if (!allowAdmin) out.admin = false;
+  return out;
+}
+app.get('/api/servers/:sid/roles', auth, (req, res) => {
+  const s = requireMember(req, res); if (!s) return;
+  res.json(serverRoles(s.id));
+});
+app.post('/api/servers/:sid/roles', auth, (req, res) => {
+  const s = requirePerm(req, res, 'manage_roles'); if (!s) return;
+  const name = cleanStr(req.body.name, 32) || 'novo cargo';
+  const r = { id: id(), server_id: s.id, name, color: validColor(req.body.color) ? req.body.color : '#99aab5', hoist: !!req.body.hoist,
+    perms: cleanPerms(req.body.perms, permsOf(s.id, req.user.id).admin), position: serverRoles(s.id).length };
+  db.roles.push(r);
+  save(); refresh(s.id);
+  res.json(r);
+});
+function requireRole(req, res) {
+  const r = db.roles.find((x) => x.id === req.params.rid);
+  if (!r) { bad(res, 'Cargo não encontrado.', 404); return null; }
+  req.params.sid = r.server_id;
+  if (!requirePerm(req, res, 'manage_roles')) return null;
+  if (r.perms?.admin && !permsOf(r.server_id, req.user.id).admin) { bad(res, 'Só administradores mexem nesse cargo.', 403); return null; }
+  return r;
+}
+app.patch('/api/roles/:rid', auth, (req, res) => {
+  const r = requireRole(req, res); if (!r) return;
+  if (req.body.name !== undefined) { const n = cleanStr(req.body.name, 32); if (!n) return bad(res, 'Nome inválido.'); r.name = n; }
+  if (req.body.color !== undefined) r.color = validColor(req.body.color) ? req.body.color : '';
+  if (req.body.hoist !== undefined) r.hoist = !!req.body.hoist;
+  if (req.body.perms !== undefined) r.perms = cleanPerms(req.body.perms, permsOf(r.server_id, req.user.id).admin);
+  if (typeof req.body.move === 'number') {
+    const list = serverRoles(r.server_id);
+    const i = list.indexOf(r), j = i + Math.sign(req.body.move);
+    if (j >= 0 && j < list.length) { [list[i], list[j]] = [list[j], list[i]]; list.forEach((x, k) => { x.position = k; }); }
+  }
+  save(); refresh(r.server_id);
+  res.json(r);
+});
+app.delete('/api/roles/:rid', auth, (req, res) => {
+  const r = requireRole(req, res); if (!r) return;
+  db.roles = db.roles.filter((x) => x.id !== r.id);
+  db.members.forEach((m) => { m.role_ids = m.role_ids.filter((x) => x !== r.id); });
+  db.channels.forEach((c) => { if (c.allowed_roles?.length) c.allowed_roles = c.allowed_roles.filter((x) => x !== r.id); });
+  const s = serverById(r.server_id);
+  if (s.default_role_id === r.id) s.default_role_id = null;
+  serverRoles(r.server_id).forEach((x, k) => { x.position = k; });
+  save(); refresh(r.server_id);
+  res.json({ ok: true });
+});
+
+// ---- categorias
+app.post('/api/servers/:sid/categories', auth, (req, res) => {
+  const s = requirePerm(req, res, 'manage_channels'); if (!s) return;
+  const name = cleanStr(req.body.name, 40);
+  if (!name) return bad(res, 'Dê um nome à categoria.');
+  const c = { id: cid(), name };
+  s.categories.push(c);
+  save(); refresh(s.id);
+  res.json(c);
+});
+app.patch('/api/servers/:sid/categories/:cat', auth, (req, res) => {
+  const s = requirePerm(req, res, 'manage_channels'); if (!s) return;
+  const c = s.categories.find((x) => x.id === req.params.cat);
+  if (!c) return bad(res, 'Categoria não encontrada.', 404);
+  if (req.body.name !== undefined) { const n = cleanStr(req.body.name, 40); if (!n) return bad(res, 'Nome inválido.'); c.name = n; }
+  if (typeof req.body.move === 'number') {
+    const i = s.categories.indexOf(c), j = i + Math.sign(req.body.move);
+    if (j >= 0 && j < s.categories.length) [s.categories[i], s.categories[j]] = [s.categories[j], s.categories[i]];
+  }
+  save(); refresh(s.id);
+  res.json(c);
+});
+app.delete('/api/servers/:sid/categories/:cat', auth, (req, res) => {
+  const s = requirePerm(req, res, 'manage_channels'); if (!s) return;
+  s.categories = s.categories.filter((x) => x.id !== req.params.cat);
+  db.channels.forEach((c) => { if (c.server_id === s.id && c.category_id === req.params.cat) c.category_id = null; });
+  save(); refresh(s.id);
+  res.json({ ok: true });
+});
+
+// ---- canais
+function channelFields(body, s, c) {
+  if (body.name !== undefined) {
+    let name = cleanStr(body.name, 40);
+    if (c.kind === 'text') name = name.toLowerCase().replace(/\s+/g, '-');
+    if (!name) return 'Dê um nome ao canal.';
+    c.name = name;
+  }
+  if (body.topic !== undefined) c.topic = cleanStr(body.topic, 200);
+  if (body.read_only !== undefined) c.read_only = !!body.read_only;
+  if (body.category_id !== undefined) c.category_id = s.categories.some((x) => x.id === body.category_id) ? body.category_id : null;
+  if (body.allowed_roles !== undefined) {
+    const valid = serverRoles(s.id).map((r) => r.id);
+    c.allowed_roles = (Array.isArray(body.allowed_roles) ? body.allowed_roles : []).filter((r) => valid.includes(r));
+  }
+  return null;
+}
+app.get('/api/servers/:sid/channels', auth, (req, res) => {
+  const s = requireMember(req, res); if (!s) return;
+  res.json(db.channels.filter((c) => c.server_id === s.id && canSee(c, req.user.id))
+    .sort((a, b) => (a.position || 0) - (b.position || 0))
+    .map((c) => ({ ...c, can_post: canPost(c, req.user.id) })));
+});
+app.post('/api/servers/:sid/channels', auth, (req, res) => {
+  const s = requirePerm(req, res, 'manage_channels'); if (!s) return;
+  const kind = req.body.kind === 'voice' ? 'voice' : 'text';
+  const c = { id: id(), server_id: s.id, name: '', kind, category_id: null, topic: '', read_only: false, allowed_roles: [],
+    position: Math.max(0, ...db.channels.filter((x) => x.server_id === s.id).map((x) => x.position || 0)) + 1, created_at: now() };
+  const err = channelFields({ ...req.body, name: req.body.name ?? '' }, s, c);
+  if (err) return bad(res, err);
+  db.channels.push(c);
+  save(); refresh(s.id);
+  res.json({ ...c, can_post: canPost(c, req.user.id) });
+});
+function requireChannel(req, res, perm) {
+  const c = channelById(req.params.cid);
+  if (!c || !canSee(c, req.user.id)) { bad(res, 'Canal não encontrado.', 404); return null; }
+  if (perm && !permsOf(c.server_id, req.user.id)[perm]) { bad(res, 'Você não tem permissão para fazer isso.', 403); return null; }
+  return c;
+}
+app.patch('/api/channels/:cid', auth, (req, res) => {
+  const c = requireChannel(req, res, 'manage_channels'); if (!c) return;
+  const s = serverById(c.server_id);
+  if (typeof req.body.move === 'number') {
+    const sibs = db.channels.filter((x) => x.server_id === s.id && x.category_id === c.category_id && x.kind === c.kind).sort((a, b) => a.position - b.position);
+    const i = sibs.indexOf(c), j = i + Math.sign(req.body.move);
+    if (j >= 0 && j < sibs.length) { const p = sibs[i].position; sibs[i].position = sibs[j].position; sibs[j].position = p; }
+  }
+  const err = channelFields(req.body, s, c);
+  if (err) return bad(res, err);
+  save(); refresh(s.id);
+  // quem perdeu acesso sai da chamada
+  for (const [, sock] of io.sockets.sockets) if (sock.data.voice === c.id && !canSee(c, sock.data.user.id)) leaveVoice(sock);
+  res.json(c);
+});
+app.delete('/api/channels/:cid', auth, (req, res) => {
+  const c = requireChannel(req, res, 'manage_channels'); if (!c) return;
+  db.channels = db.channels.filter((x) => x.id !== c.id);
+  db.messages = db.messages.filter((m) => m.channel_id !== c.id);
+  save();
+  for (const [, sock] of io.sockets.sockets) if (sock.data.voice === c.id) leaveVoice(sock);
+  refresh(c.server_id);
+  res.json({ ok: true });
+});
+
+// ---- mensagens
+function messagePayload(m) {
+  const u = userById(m.author_id);
+  return { ...m, author_name: u ? u.display_name : m.author_name, author_avatar: u ? u.avatar_url : '', author_color: topRole(m.server_id, m.author_id)?.color || '' };
+}
+function emitToChannel(c, event, payload) {
+  for (const sock of io.sockets.adapter.rooms.get(`server:${c.server_id}`) || []) {
+    const s = io.sockets.sockets.get(sock);
+    if (s && canSee(c, s.data.user.id)) s.emit(event, payload);
+  }
+}
+app.get('/api/channels/:cid/messages', auth, (req, res) => {
+  const c = requireChannel(req, res); if (!c) return;
+  let list = db.messages.filter((m) => m.channel_id === c.id);
+  if (req.query.before) list = list.filter((m) => m.created_at < req.query.before);
+  res.json(list.slice(-50).map(messagePayload));
+});
+const rate = new Map();
+app.post('/api/channels/:cid/messages', auth, (req, res) => {
+  const c = requireChannel(req, res); if (!c) return;
+  if (c.kind !== 'text') return bad(res, 'Este canal não aceita mensagens.');
+  if (!canPost(c, req.user.id)) return bad(res, 'Você não tem permissão para enviar mensagens neste canal.', 403);
+  const t = Date.now();
+  const hits = (rate.get(req.user.id) || []).filter((x) => t - x < 5000);
+  if (hits.length >= 5) return bad(res, 'Calma! Você está enviando mensagens rápido demais.', 429);
+  hits.push(t); rate.set(req.user.id, hits);
+  const content = String(req.body.content || '').trim().slice(0, 2000);
+  if (!content) return bad(res, 'Mensagem vazia.');
+  const m = { id: id(), channel_id: c.id, server_id: c.server_id, author_id: req.user.id, author_name: req.user.display_name, content, created_at: now() };
+  db.messages.push(m);
+  save();
+  const p = messagePayload(m);
+  emitToChannel(c, 'message:created', p);
+  res.json(p);
+});
+app.delete('/api/messages/:mid', auth, (req, res) => {
+  const m = db.messages.find((x) => x.id === req.params.mid);
+  if (!m) return bad(res, 'Mensagem não encontrada.', 404);
+  if (m.author_id !== req.user.id && !permsOf(m.server_id, req.user.id).manage_messages) return bad(res, 'Sem permissão.', 403);
+  db.messages = db.messages.filter((x) => x.id !== m.id);
+  save();
+  const c = channelById(m.channel_id);
+  if (c) emitToChannel(c, 'message:deleted', { id: m.id, channel_id: m.channel_id });
   res.json({ ok: true });
 });
 
@@ -272,88 +640,12 @@ app.post('/api/invite/:code/join', auth, (req, res) => {
   const s = db.servers.find((x) => x.invite_code === req.params.code);
   if (!s) return bad(res, 'Convite inválido ou expirado.', 404);
   if (!isMember(s.id, req.user.id)) {
-    db.members.push({ id: id(), server_id: s.id, user_id: req.user.id, joined_at: now() });
+    db.members.push({ id: id(), server_id: s.id, user_id: req.user.id, role_ids: s.default_role_id ? [s.default_role_id] : [], joined_at: now() });
     save();
     joinSocketsToServer(req.user.id, s.id);
-    io.to(`server:${s.id}`).emit('member:joined', { server_id: s.id, user: publicUser(req.user) });
+    io.to(`server:${s.id}`).emit('member:joined', { server_id: s.id, user: { ...publicUser(req.user), email: undefined } });
   }
   res.json(serverPayload(s, req.user.id));
-});
-
-// ---- canais
-app.get('/api/servers/:sid/channels', auth, (req, res) => {
-  const s = requireMember(req, res); if (!s) return;
-  res.json(db.channels.filter((c) => c.server_id === s.id));
-});
-app.post('/api/servers/:sid/channels', auth, (req, res) => {
-  const s = requireOwner(req, res); if (!s) return;
-  const kind = req.body.kind === 'voice' ? 'voice' : 'text';
-  let name = cleanStr(req.body.name, 40);
-  if (kind === 'text') name = name.toLowerCase().replace(/\s+/g, '-');
-  if (!name) return bad(res, 'Dê um nome ao canal.');
-  const c = { id: id(), server_id: s.id, name, kind, created_at: now() };
-  db.channels.push(c);
-  save();
-  io.to(`server:${s.id}`).emit('channel:created', c);
-  res.json(c);
-});
-function requireChannel(req, res, owner = false) {
-  const c = channelById(req.params.cid);
-  if (!c || !isMember(c.server_id, req.user.id)) { bad(res, 'Canal não encontrado.', 404); return null; }
-  if (owner && serverById(c.server_id).owner_id !== req.user.id) { bad(res, 'Só o dono do servidor pode fazer isso.', 403); return null; }
-  return c;
-}
-app.patch('/api/channels/:cid', auth, (req, res) => {
-  const c = requireChannel(req, res, true); if (!c) return;
-  let name = cleanStr(req.body.name, 40);
-  if (c.kind === 'text') name = name.toLowerCase().replace(/\s+/g, '-');
-  if (!name) return bad(res, 'Nome inválido.');
-  c.name = name; save();
-  io.to(`server:${c.server_id}`).emit('channel:updated', c);
-  res.json(c);
-});
-app.delete('/api/channels/:cid', auth, (req, res) => {
-  const c = requireChannel(req, res, true); if (!c) return;
-  db.channels = db.channels.filter((x) => x.id !== c.id);
-  db.messages = db.messages.filter((m) => m.channel_id !== c.id);
-  save();
-  for (const [, sock] of io.sockets.sockets) if (sock.data.voice === c.id) leaveVoice(sock);
-  io.to(`server:${c.server_id}`).emit('channel:deleted', { id: c.id, server_id: c.server_id });
-  res.json({ ok: true });
-});
-
-// ---- mensagens
-function messagePayload(m) {
-  const u = userById(m.author_id);
-  return { ...m, author_name: u ? u.display_name : m.author_name, author_avatar: u ? u.avatar_url : '' };
-}
-app.get('/api/channels/:cid/messages', auth, (req, res) => {
-  const c = requireChannel(req, res); if (!c) return;
-  let list = db.messages.filter((m) => m.channel_id === c.id);
-  if (req.query.before) list = list.filter((m) => m.created_at < req.query.before);
-  res.json(list.slice(-50).map(messagePayload));
-});
-app.post('/api/channels/:cid/messages', auth, (req, res) => {
-  const c = requireChannel(req, res); if (!c) return;
-  if (c.kind !== 'text') return bad(res, 'Este canal não aceita mensagens.');
-  const content = String(req.body.content || '').trim().slice(0, 2000);
-  if (!content) return bad(res, 'Mensagem vazia.');
-  const m = { id: id(), channel_id: c.id, server_id: c.server_id, author_id: req.user.id, author_name: req.user.display_name, content, created_at: now() };
-  db.messages.push(m);
-  save();
-  const p = messagePayload(m);
-  io.to(`server:${c.server_id}`).emit('message:created', p);
-  res.json(p);
-});
-app.delete('/api/messages/:mid', auth, (req, res) => {
-  const m = db.messages.find((x) => x.id === req.params.mid);
-  if (!m) return bad(res, 'Mensagem não encontrada.', 404);
-  const s = serverById(m.server_id);
-  if (m.author_id !== req.user.id && s?.owner_id !== req.user.id) return bad(res, 'Sem permissão.', 403);
-  db.messages = db.messages.filter((x) => x.id !== m.id);
-  save();
-  io.to(`server:${m.server_id}`).emit('message:deleted', { id: m.id, channel_id: m.channel_id });
-  res.json({ ok: true });
 });
 
 // ---- config de chamada (STUN/TURN)
@@ -366,7 +658,7 @@ app.get('/api/config', (req, res) => {
 });
 
 // ---- front-end
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(path.join(__dirname, 'public'), { etag: true, maxAge: 0 }));
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
 // ---------------------------------------------------------------- tempo real
@@ -382,8 +674,8 @@ function joinSocketsToServer(uid, sid) {
 
 // voz: channelId -> Map(socketId -> estado)
 const voice = new Map();
-function voiceList(cid) {
-  const room = voice.get(cid);
+function voiceList(vcid) {
+  const room = voice.get(vcid);
   if (!room) return [];
   return [...room.entries()].map(([sockId, st]) => {
     const u = userById(st.user_id);
@@ -391,23 +683,20 @@ function voiceList(cid) {
       muted: st.muted, deafened: st.deafened, camera: st.camera, screen: st.screen };
   });
 }
-function broadcastVoice(cid) {
-  const c = channelById(cid);
-  if (c) io.to(`server:${c.server_id}`).emit('voice:state', { channel_id: cid, participants: voiceList(cid) });
+function broadcastVoice(vcid) {
+  const c = channelById(vcid);
+  if (c) emitToChannel(c, 'voice:state', { channel_id: vcid, participants: voiceList(vcid) });
 }
 function leaveVoice(sock) {
-  const cid = sock.data.voice;
-  if (!cid) return;
-  const room = voice.get(cid);
-  if (room) {
-    room.delete(sock.id);
-    if (!room.size) voice.delete(cid);
-  }
+  const vcid = sock.data.voice;
+  if (!vcid) return;
+  const room = voice.get(vcid);
+  if (room) { room.delete(sock.id); if (!room.size) voice.delete(vcid); }
   sock.data.voice = null;
-  sock.leave(`voice:${cid}`);
-  io.to(`voice:${cid}`).emit('rtc:peer-left', { socket_id: sock.id });
-  sock.emit('voice:left', { channel_id: cid });
-  broadcastVoice(cid);
+  sock.leave(`voice:${vcid}`);
+  io.to(`voice:${vcid}`).emit('rtc:peer-left', { socket_id: sock.id });
+  sock.emit('voice:left', { channel_id: vcid });
+  broadcastVoice(vcid);
 }
 
 io.use((sock, next) => {
@@ -425,40 +714,36 @@ io.on('connection', (sock) => {
   sock.on('voice:snapshot', (sid, cb) => {
     if (typeof cb !== 'function' || !isMember(sid, uid)) return;
     const out = {};
-    db.channels.filter((c) => c.server_id === sid && c.kind === 'voice').forEach((c) => { out[c.id] = voiceList(c.id); });
+    db.channels.filter((c) => c.server_id === sid && c.kind === 'voice' && canSee(c, uid)).forEach((c) => { out[c.id] = voiceList(c.id); });
     cb(out);
   });
-
-  sock.on('voice:join', (cid, cb) => {
-    const c = channelById(cid);
-    if (!c || c.kind !== 'voice' || !isMember(c.server_id, uid)) return cb?.({ error: 'Canal indisponível.' });
+  sock.on('voice:join', (vcid, cb) => {
+    const c = channelById(vcid);
+    if (!c || c.kind !== 'voice' || !canSee(c, uid)) return cb?.({ error: 'Canal indisponível.' });
     if (sock.data.voice) leaveVoice(sock);
-    const existing = voiceList(cid);
-    if (!voice.has(cid)) voice.set(cid, new Map());
-    voice.get(cid).set(sock.id, { user_id: uid, muted: false, deafened: false, camera: false, screen: false });
-    sock.data.voice = cid;
-    sock.join(`voice:${cid}`);
-    cb?.({ ok: true, peers: existing });
-    broadcastVoice(cid);
+    const existing = voiceList(vcid);
+    if (!voice.has(vcid)) voice.set(vcid, new Map());
+    const listenOnly = !canPost(c, uid);
+    voice.get(vcid).set(sock.id, { user_id: uid, muted: listenOnly, deafened: false, camera: false, screen: false, listenOnly });
+    sock.data.voice = vcid;
+    sock.join(`voice:${vcid}`);
+    cb?.({ ok: true, peers: existing, listen_only: listenOnly });
+    broadcastVoice(vcid);
   });
-
   sock.on('voice:leave', () => leaveVoice(sock));
-
   sock.on('voice:update', (patch = {}) => {
-    const cid = sock.data.voice;
-    const st = cid && voice.get(cid)?.get(sock.id);
+    const vcid = sock.data.voice;
+    const st = vcid && voice.get(vcid)?.get(sock.id);
     if (!st) return;
     for (const k of ['muted', 'deafened', 'camera', 'screen']) if (typeof patch[k] === 'boolean') st[k] = patch[k];
-    broadcastVoice(cid);
+    if (st.listenOnly) { st.muted = true; st.camera = false; st.screen = false; }
+    broadcastVoice(vcid);
   });
-
-  // sinalização WebRTC — só entre pessoas do mesmo canal de voz
   sock.on('rtc:signal', ({ to, data } = {}) => {
     const target = io.sockets.sockets.get(to);
     if (!target || !sock.data.voice || target.data.voice !== sock.data.voice) return;
     target.emit('rtc:signal', { from: sock.id, data });
   });
-
   sock.on('disconnect', () => leaveVoice(sock));
 });
 
