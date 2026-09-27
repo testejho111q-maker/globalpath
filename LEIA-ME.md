@@ -39,11 +39,20 @@ Sem isso, no Render grátis contas, mensagens e arquivos somem quando o site rei
 6. Nos **Logs** do Render deve aparecer "MongoDB conectado". Pronto: dados, fotos e áudios ficam salvos.
 
 ## Chamadas que não conectam
-As chamadas são diretas entre os navegadores (WebRTC). Na maioria das redes funciona só com o servidor STUN do Google, que já vem configurado. Em algumas redes (4G de algumas operadoras, redes de empresa), é preciso um servidor **TURN**. O Lumix já usa um TURN público grátis (Open Relay). Para uma conexão mais estável, crie uma conta grátis em https://www.metered.ca/stun-turn e adicione no Render `METERED_DOMAIN` (ex.: seuapp.metered.live) e `METERED_API_KEY`. Ou informe seus próprios servidores em `ICE_SERVERS`, por exemplo:
+As chamadas são diretas entre os navegadores (WebRTC). Na maioria das redes funciona só com o servidor STUN do Google, que já vem configurado. Em algumas redes (4G de algumas operadoras, redes de empresa), é preciso um servidor **TURN**. O Lumix já usa um TURN público grátis (Open Relay). **Atraso para quem está longe:** o Open Relay fica fora do Brasil. Com o **Cloudflare TURN** (grátis até 1000 GB/mês, tem servidores no Brasil) o atraso cai bastante: no painel da Cloudflare, vá em *Realtime → TURN Server*, crie uma chave e adicione no Render `CF_TURN_KEY_ID` (Turn Token ID) e `CF_TURN_TOKEN` (API Token). Outra opção: crie uma conta grátis em https://www.metered.ca/stun-turn e adicione no Render `METERED_DOMAIN` (ex.: seuapp.metered.live) e `METERED_API_KEY`. Ou informe seus próprios servidores em `ICE_SERVERS`, por exemplo:
 
 ```
 ICE_SERVERS=[{"urls":"stun:stun.l.google.com:19302"},{"urls":"turn:SEU-SERVIDOR:80","username":"USUARIO","credential":"SENHA"}]
 ```
+
+## Área administrativa (/admin)
+A **primeira conta criada** é a **Dona** da Lumix (ou os e-mails em `ADMIN_EMAILS`). A equipe entra pelo escudo 🛡️ na barra da esquerda ou em `/admin`.
+
+- **Cargos:** Dono > Administrador > Moderador. Só o Dono promove administradores; administradores nomeiam moderadores; ninguém age sobre alguém do mesmo cargo ou acima.
+- **Segurança:** todas as rotas `/api/admin` são verificadas no servidor. A equipe precisa ter a **verificação em duas etapas** ligada e ter entrado com o código. Senhas, códigos e tokens nunca aparecem no painel.
+- **Seções:** Visão geral (dados reais), Usuários (pesquisar por nome, @, ID ou e-mail; advertir, suspender, banir, reativar — sempre com motivo), Comunidades (estrutura e responsáveis, suspender), Denúncias (fila com contexto; conversas privadas mostram só a mensagem denunciada), Atualizações (canal "Novidades da Lumix"), Suporte (Aberto / Em atendimento / Resolvido), Cargos e permissões, Registro de ações (permanente, ninguém apaga) e Configurações.
+
+**E-mail:** com `BREVO_API_KEY` + `MAIL_FROM` (Brevo grátis, 300/dia) ou `RESEND_API_KEY` + `MAIL_FROM`, a confirmação de cadastro e a **recuperação de senha** funcionam por e-mail. Sem e-mail, a recuperação de senha fica desligada (por segurança a equipe não gera códigos).
 
 ## IA que monta o servidor
 Sem configurar nada, o botão **Montar com IA** usa um assistente básico que entende palavras-chave (jogos, clã, RP, live, música, estudos…).

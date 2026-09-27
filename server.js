@@ -14,7 +14,7 @@ const SESSION_DAYS = 30;
 
 // ---------------------------------------------------------------- banco
 fs.mkdirSync(DATA_DIR, { recursive: true });
-const EMPTY = { users: [], sessions: [], servers: [], members: [], channels: [], messages: [], roles: [], dms: [], dm_messages: [], uploads: [], friends: [], blocks: [], reports: [] };
+const EMPTY = { users: [], sessions: [], servers: [], members: [], channels: [], messages: [], roles: [], dms: [], dm_messages: [], uploads: [], friends: [], blocks: [], reports: [], audit: [], updates: [], tickets: [] };
 let db;
 try {
   db = { ...JSON.parse(JSON.stringify(EMPTY)), ...JSON.parse(fs.readFileSync(DB_FILE, 'utf8')) };
@@ -81,15 +81,26 @@ function checkPassword(pw, stored) {
 
 const publicUser = (u) => u && ({ id: u.id, username: u.username || '', display_name: u.display_name, avatar_url: u.avatar_url || '', email: u.email,
   bio: u.bio || '', status_text: u.status_text || '', banner_url: u.banner_url || '', accent: u.accent || '', privacy: privacyOf(u),
-  two_factor: !!u.totp_secret, is_admin: isAdmin(u), badges: badgesOf(u), created_at: u.created_at });
+  two_factor: !!u.totp_secret, is_admin: isAdmin(u), is_owner: isOwnerUser(u), staff_rank: rankOf(u), badges: badgesOf(u), created_at: u.created_at,
+  status: u.status || 'active', verify_via: u.verify_via || '', announcement: settings().announcement || '', notices: u.notices || [],
+  updates_unseen: db.updates.filter((x) => x.created_at > (u.updates_seen || u.created_at || '')).length });
 function privacyOf(u) { return { dms: u.privacy?.dms || 'servers', friend_requests: u.privacy?.friend_requests || 'everyone', show_bio: u.privacy?.show_bio !== false }; }
 // administradores da plataforma: e-mails em ADMIN_EMAILS, ou a primeira conta criada
-function isAdmin(u) {
+function isOwnerUser(u) {
   if (!u) return false;
   const list = String(process.env.ADMIN_EMAILS || '').toLowerCase().split(/[,;\s]+/).filter(Boolean);
   if (list.length) return list.includes(u.email);
   return db.users[0]?.id === u.id;
 }
+// cargo na equipe da plataforma: 3 Dono, 2 Administrador, 1 Moderador, 0 membro
+function rankOf(u) { if (!u) return 0; if (isOwnerUser(u)) return 3; return u.role === 'admin' ? 2 : u.role === 'mod' ? 1 : 0; }
+function isAdmin(u) { return rankOf(u) > 0; }
+const isSuspended = (u) => !!u?.suspended_until && new Date(u.suspended_until) > new Date();
+function blockedMsg(u) {
+  if (u.banned) return `Esta conta foi banida da Lumix.${u.ban_reason ? ` Motivo: ${u.ban_reason}` : ''}`;
+  return `Esta conta está suspensa até ${new Date(u.suspended_until).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' })}.${u.suspend_reason ? ` Motivo: ${u.suspend_reason}` : ''}`;
+}
+const settings = () => (db.settings ||= { verification: 'approval', signups_open: true, announcement: '' });
 const FOUNDER_LIMIT = Number(process.env.FOUNDER_LIMIT || 100);
 function badgesOf(u) {
   const out = [];
@@ -131,6 +142,7 @@ function permsOf(sid, uid) {
 }
 function canSee(c, uid) {
   if (!c || !isMember(c.server_id, uid)) return false;
+  if (serverById(c.server_id)?.suspended) return false;
   if (!c.allowed_roles?.length) return true;
   if (permsOf(c.server_id, uid).admin) return true;
   const m = memberOf(c.server_id, uid);
@@ -150,6 +162,7 @@ function topRole(sid, uid) {
 }
 
 // ---------------------------------------------------------------- modelos / planos de servidor
+const LUMIX_RULES = "📜 **REGRAS DA COMUNIDADE LUMIX**\nSeja bem-vindo! Para manter a comunidade organizada e acolhedora, siga estas regras:\n\n1️⃣ **RESPEITE TODOS** — Nada de ofensas, discriminação, ameaças, perseguição ou humilhação. Discordar faz parte; atacar pessoas, não.\n2️⃣ **SEM SPAM** — Não envie mensagens repetidas, flood, correntes ou menções em massa. Divulgações somente nos espaços autorizados.\n3️⃣ **CONTEÚDO APROPRIADO** — É proibido publicar pornografia, conteúdo sexual envolvendo menores, violência gráfica ou material ilegal.\n4️⃣ **PROTEJA A PRIVACIDADE** — Não divulgue dados pessoais, senhas, fotos íntimas ou conversas privadas de outras pessoas sem autorização.\n5️⃣ **NADA DE GOLPES** — Links maliciosos, phishing, arquivos perigosos, falsas promoções e tentativas de roubar contas são proibidos.\n6️⃣ **NÃO SE PASSE POR OUTRA PESSOA** — Não finja ser membro da equipe, outro usuário ou representante de uma empresa. Contas de fãs e paródias devem ser claramente identificadas.\n7️⃣ **USE OS CANAIS CORRETOS** — Mantenha as conversas no assunto de cada canal. O canal de atualizações é reservado aos comunicados oficiais da equipe.\n8️⃣ **NÃO ABUSE DE BUGS** — Encontrou uma falha? Avise a equipe em particular. Não explore vulnerabilidades, acesse dados de terceiros ou ensine a prejudicar a plataforma.\n9️⃣ **RESPEITE OS LIMITES DOS OUTROS** — Não insista em contato após uma recusa ou bloqueio. Não crie outras contas para perseguir usuários ou contornar punições.\n🔟 **DENUNCIE COM RESPONSABILIDADE** — Use as ferramentas de denúncia ou procure a moderação. Envie provas sem expor dados pessoais publicamente. Denúncias falsas de propósito também podem gerar punição.\n\n⚖️ **MODERAÇÃO** — Conforme a gravidade e a reincidência, infrações podem resultar em remoção de conteúdo, advertência, restrição, suspensão ou banimento. Casos graves podem levar a banimento imediato. Para contestar uma decisão, procure o suporte com respeito.\n\n💙 Ajude a fazer da Lumix um lugar onde todos possam conversar e participar com tranquilidade!";
 // Um "plano" descreve cargos, categorias e canais. O modelo streamer e a IA geram planos.
 const STREAMER_PLAN = {
   roles: [
@@ -191,22 +204,13 @@ const STREAMER_PLAN = {
       { name: '🔊 Reunião Staff', kind: 'voice' },
     ] },
   ],
-  rules: [
-    '📜 **Regras do servidor**', '',
-    '1. Respeito acima de tudo — sem ofensas, preconceito ou assédio.',
-    '2. Nada de spam, flood ou divulgação sem permissão da Staff.',
-    '3. Conteúdo +18, violento ou ilegal é proibido.',
-    '4. Use cada canal para o assunto certo.',
-    '5. Não peça cargo — a Staff dá cargo para quem ajuda a comunidade.',
-    '6. Siga as orientações da Staff.', '',
-    'Quem quebrar as regras pode levar castigo, expulsão ou banimento. Bora jogar! 🎮',
-  ].join('\n'),
+  rules: LUMIX_RULES,
 };
 
 // limpa e limita um plano vindo de fora (IA ou navegador)
 function sanitizePlan(plan) {
   const str = (v, n) => String(v ?? '').replace(/[\u0000-\u001f]/g, ' ').trim().slice(0, n);
-  const out = { roles: [], categories: [], rules: str(plan?.rules, 1800) };
+  const out = { roles: [], categories: [], rules: str(plan?.rules, 4000) };
   let owner = false, def = false;
   (Array.isArray(plan?.roles) ? plan.roles : []).slice(0, 12).forEach((r) => {
     const name = str(r?.name, 32); if (!name) return;
@@ -359,14 +363,14 @@ function localPlan(prompt, useEmoji = true) {
     [/\bcod\b|warzone/, 'warzone', '🪖'], [/pubg/, 'pubg', '🍳'], [/apex/, 'apex', '🦊'], [/rocket/, 'rocket-league', '🚗'],
   ];
   const games = GAMES.filter(([re]) => re.test(t));
-  const streamer = has(/stream|youtube|canal|live|inscrit|twitch|tiktok|criador/);
+  const streamer = has(/stream|youtube|meu canal|live|inscrit|twitch|tiktok|criador/);
   const clan = has(/cl[aã]|time\b|equipe|squad|campeonato|x1|treino|guild|guilda/);
   const rp = has(/\brp\b|roleplay|cidade/);
   const study = has(/estud|escola|faculdade|prova|curso/);
   const music = has(/m[uú]sica|funk|rap|trap|beat|dj/);
   const anime = has(/anime|mang[aá]|otaku/);
   const events = has(/sorteio|evento|premia/);
-  const shop = has(/loja|venda|vender|compra/);
+  const shop = has(/loja|lojinha|vender|venda de|compra e venda/);
   const noStaff = has(/sem staff|sem modera/);
   const voices = Math.min(6, Math.max(2, Number((t.match(/(\d+)\s*(salas?|calls?|canais de voz)/) || [])[1]) || (games.length > 2 ? 4 : 3)));
 
@@ -431,17 +435,70 @@ function localPlan(prompt, useEmoji = true) {
 
   if (!noStaff) cats.push({ name: eS('🛡️', 'Staff'), private: true, channels: [{ name: e('🔒', 'staff-chat'), kind: 'text' }, { name: eS('🔊', 'Reunião'), kind: 'voice' }] });
 
-  const rules = [
-    useEmoji ? '📜 **Regras**' : '**Regras**', '',
-    '1. Respeito com todo mundo — sem ofensas, preconceito ou assédio.',
-    '2. Sem spam, flood ou divulgação sem permissão.',
-    '3. Nada de conteúdo +18, violento ou ilegal.',
-    '4. Cada assunto no seu canal.',
-    ...(games.length ? ['5. Sem hack, trapaça ou venda de conta.'] : []),
-    ...(rp ? ['6. Respeite o RP: sem metagaming nem powergaming.'] : []),
-    '', 'Quem quebrar as regras pode levar castigo ou banimento.',
-  ].join('\n');
-  return { roles, categories: cats, rules };
+  const rules = useEmoji ? LUMIX_RULES : LUMIX_RULES.replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}\u{20E3}]/gu, '').replace(/\n\s+/g, '\n');
+  applyCustom(prompt, { roles, cats, e, eS, useEmoji });
+  return { roles, categories: cats.filter((c) => c.channels.length), rules };
+}
+
+// entende pedidos como "canais: vendas, parcerias", "um canal de vendas", "cargo de moderador", "sem memes"
+function extractCustom(prompt) {
+  const out = { text: [], voice: [], roles: [], cats: [], remove: [] };
+  const src = ` ${String(prompt).replace(/\n+/g, '. ')} `;
+  const clean = (x) => x.replace(/["'“”‘’]/g, '').replace(/^(o|a|os|as|um|uma|uns|umas|de|do|da|dos|das|pra|para|chamad[oa]s?)\s+/i, '').trim();
+  // corta a lista quando começa outro pedido ("..., uma sala de voz", "e cargo de...", "sem ...")
+  const cut = (str) => str.split(/(?:,|;|\s+e\s+)\s*(?:uma?s?\s+|umas?\s+|os?\s+|as?\s+)?(?=(?:salas?|cargos?|categorias?|sem|canal|canais|calls?)\b)/i)[0];
+  const list = (str) => cut(str).split(/,|;|\/|\s+e\s+/i).map(clean).filter((x) => x && x.length <= 30 && x.split(/\s+/).length <= 4 && !/^(salas?|cargos?|categorias?|sem)\b/i.test(x));
+  const all = (re) => [...src.matchAll(re)];
+  const stop = '(?=[,.;!?]|\\s+e\\s|\\s+com\\s|\\s+pra\\s|\\s+para\\s|$)';
+  for (const m of all(/(?:canais|chats)\s*(?:de\s*texto)?\s*[:=]\s*([^.\n]+)/gi)) out.text.push(...list(m[1]));
+  for (const m of all(/(?:salas|canais|calls)\s*de\s*voz\s*[:=]\s*([^.\n]+)/gi)) out.voice.push(...list(m[1]));
+  for (const m of all(/cargos\s*[:=]\s*([^.\n]+)/gi)) out.roles.push(...list(m[1]));
+  for (const m of all(/categorias?\s*[:=]\s*([^.\n]+)/gi)) out.cats.push(...list(m[1]));
+  for (const m of all(new RegExp(`(?<!meu |seu |do |no |pro |nosso )\\bcana(?:l|is)\\s+(?:de\\s+texto\\s+)?(?:chamados?|de|pra|para|do|da|dos|das|com nome)\\s+([a-z0-9à-ú\\- ]{2,25}?)${stop}`, 'gi'))) {
+    const v = clean(m[1]); if (v && !/^voz\b/i.test(v)) out.text.push(...list(v));
+  }
+  for (const m of all(new RegExp(`\\b(?:salas?|canal|canais|calls?)\\s+de\\s+voz\\s+(?:chamad[ao]s?|de|pra|para|do|da|dos|das)\\s+([a-z0-9à-ú\\- ]{2,25}?)${stop}`, 'gi'))) out.voice.push(...list(m[1]));
+  for (const m of all(new RegExp(`\\bcargos?\\s+(?:chamados?|de|pra|para)\\s+([a-z0-9à-ú\\- ]{2,25}?)${stop}`, 'gi'))) out.roles.push(...list(m[1]));
+  for (const m of all(new RegExp(`\\bcategorias?\\s+(?:(?:chamadas?|de|pra|para)\\s+)?([a-z0-9à-ú\\- ]{2,25}?)${stop}`, 'gi'))) out.cats.push(...list(m[1]));
+  for (const m of all(new RegExp(`\\bsem\\s+([a-zà-ú\\- ]{3,20}?)${stop}`, 'gi'))) out.remove.push(clean(m[1]).toLowerCase());
+  const uniq = (a) => [...new Set(a.map((x) => x.trim()).filter(Boolean))].slice(0, 15);
+  Object.keys(out).forEach((k) => { out[k] = uniq(out[k]); });
+  return out;
+}
+const slug = (x) => x.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+const plain = (x) => slug(String(x).replace(/[^\p{L}\p{N}\s-]/gu, ''));
+function applyCustom(prompt, { roles, cats, e, eS }) {
+  const c = extractCustom(prompt);
+  // "sem X": tira canais, categorias e cargos com esse nome
+  c.remove.filter((r) => !/emoji|staff|modera/.test(r)).forEach((r) => {
+    const key = slug(r).replace(/s$/, '');
+    if (!key) return;
+    for (let i = cats.length - 1; i >= 0; i--) {
+      if (plain(cats[i].name).includes(key)) { cats.splice(i, 1); continue; }
+      cats[i].channels = cats[i].channels.filter((ch) => !plain(ch.name).includes(key));
+    }
+    for (let i = roles.length - 1; i >= 0; i--) if (!roles[i].owner && plain(roles[i].name).includes(key)) roles.splice(i, 1);
+  });
+  const has = (name, kind) => cats.some((cat) => cat.channels.some((ch) => ch.kind === kind && plain(ch.name) === slug(name)));
+  const texts = c.text.filter((x) => !has(x, 'text')).map((x) => ({ name: slug(x) || x, kind: 'text' }));
+  const voices = c.voice.filter((x) => !has(x, 'voice')).map((x) => ({ name: eS('🔊', x.charAt(0).toUpperCase() + x.slice(1)), kind: 'voice' }));
+  if (c.cats.length) {
+    c.cats.forEach((name, i) => {
+      if (cats.some((cat) => plain(cat.name) === slug(name))) return;
+      const chans = i === 0 ? [...texts, ...voices] : [];
+      if (!chans.length) chans.push({ name: slug(name) || 'geral', kind: 'text' });
+      cats.splice(Math.min(2, cats.length), 0, { name: eS('✨', name.charAt(0).toUpperCase() + name.slice(1)), channels: chans });
+    });
+  } else if (texts.length || voices.length) {
+    cats.splice(Math.min(2, cats.length), 0, { name: eS('✨', 'Do seu jeito'), channels: [...texts, ...voices] });
+  }
+  const colors = ['#3b82f6', '#a855f7', '#ec4899', '#06b6d4', '#eab308', '#22c55e', '#f97316'];
+  c.roles.forEach((r, i) => {
+    if (roles.some((x) => plain(x.name) === slug(r))) return;
+    const mod = /mod|adm|staff|ajudante|suporte|gerente/i.test(r);
+    roles.splice(Math.max(1, roles.length - 1), 0, { name: r.charAt(0).toUpperCase() + r.slice(1), color: mod ? '#f97316' : colors[i % colors.length], hoist: true,
+      perms: mod ? { manage_messages: true, kick: true } : {}, staff: mod });
+  });
 }
 
 async function makePlan(prompt, useEmoji) {
@@ -576,11 +633,11 @@ function deviceLabel(ua = '') {
   const br = /Edg\//.test(ua) ? 'Edge' : /OPR\//.test(ua) ? 'Opera' : /Chrome\//.test(ua) ? 'Chrome' : /Firefox\//.test(ua) ? 'Firefox' : /Safari\//.test(ua) ? 'Safari' : 'Navegador';
   return `${br} · ${os}`;
 }
-function setSession(req, res, userId) {
+function setSession(req, res, userId, extra = {}) {
   const token = crypto.randomBytes(32).toString('hex');
   const expires = new Date(Date.now() + SESSION_DAYS * 864e5);
   db.sessions.push({ token, sid: crypto.randomBytes(6).toString('hex'), user_id: userId, expires: expires.toISOString(),
-    created_at: now(), last_seen: now(), device: deviceLabel(String(req.headers['user-agent'] || '')), ip: String(req.ip || '').replace(/^::ffff:/, '') });
+    created_at: now(), last_seen: now(), device: deviceLabel(String(req.headers['user-agent'] || '')), ip: String(req.ip || '').replace(/^::ffff:/, ''), ...extra });
   // limpa sessões vencidas
   const t = new Date();
   db.sessions = db.sessions.filter((x) => new Date(x.expires) > t);
@@ -588,11 +645,13 @@ function setSession(req, res, userId) {
   const secure = req.secure ? '; Secure' : '';
   res.setHeader('Set-Cookie', `${COOKIE}=${token}; HttpOnly; Path=/; SameSite=Lax; Expires=${expires.toUTCString()}${secure}`);
 }
+const PENDING_OK = new Set(['/api/me', '/api/auth/verify', '/api/auth/resend', '/api/auth/logout']);
 function auth(req, res, next) {
   const s = sessionFromCookie(req.headers.cookie);
   const u = s && userById(s.user_id);
   if (!u) return res.status(401).json({ error: 'Faça login para continuar.' });
-  if (u.banned) return res.status(403).json({ error: 'Esta conta foi suspensa por violar as regras.' });
+  if (u.banned || isSuspended(u)) return res.status(403).json({ error: blockedMsg(u) });
+  if (u.status === 'pending' && !PENDING_OK.has(req.path)) return res.status(403).json({ error: 'Seu cadastro ainda está aguardando liberação.', pending: true });
   if (!s.last_seen || Date.now() - new Date(s.last_seen) > 5 * 60e3) { s.last_seen = now(); save(); }
   req.user = u; req.session = s;
   next();
@@ -603,7 +662,50 @@ const validImage = (v) => !v || (typeof v === 'string' && /^data:image\/(png|jpe
 const validColor = (v) => /^#[0-9a-f]{6}$/i.test(String(v || ''));
 
 // ---- auth
-app.post('/api/auth/register', (req, res) => {
+// envio de e-mail (opcional): BREVO_API_KEY + MAIL_FROM, ou RESEND_API_KEY + MAIL_FROM
+const mailReady = () => !!((process.env.BREVO_API_KEY || process.env.RESEND_API_KEY) && process.env.MAIL_FROM);
+async function sendMail(to, subject, html) {
+  const from = process.env.MAIL_FROM;
+  try {
+    if (process.env.BREVO_API_KEY) {
+      const r = await fetch('https://api.brevo.com/v3/smtp/email', { method: 'POST', headers: { 'api-key': process.env.BREVO_API_KEY, 'content-type': 'application/json' },
+        body: JSON.stringify({ sender: { name: 'Lumix', email: from }, to: [{ email: to }], subject, htmlContent: html }) });
+      if (!r.ok) throw new Error(await r.text());
+      return true;
+    }
+    if (process.env.RESEND_API_KEY) {
+      const r = await fetch('https://api.resend.com/emails', { method: 'POST', headers: { Authorization: `Bearer ${process.env.RESEND_API_KEY}`, 'content-type': 'application/json' },
+        body: JSON.stringify({ from: `Lumix <${from}>`, to: [to], subject, html }) });
+      if (!r.ok) throw new Error(await r.text());
+      return true;
+    }
+  } catch (e) { console.warn('E-mail falhou:', String(e.message).slice(0, 200)); }
+  return false;
+}
+const code6 = () => String(crypto.randomInt(0, 1e6)).padStart(6, '0');
+const mailBox = (title, code, text) => `<div style="font-family:Arial,sans-serif;max-width:420px;margin:auto;padding:24px;background:#0b1122;color:#eef2fb;border-radius:14px">
+  <h2 style="margin:0 0 8px">${title}</h2><p style="color:#a3aec7">${text}</p>
+  <div style="font-size:32px;letter-spacing:8px;font-weight:bold;background:#141c32;padding:14px;border-radius:10px;text-align:center">${code}</div>
+  <p style="color:#66718c;font-size:12px">Se não foi você, ignore este e-mail.</p></div>`;
+// pede liberação: manda o código por e-mail ou para o painel do dono
+async function startVerification(user) {
+  const st = settings();
+  user.verify_code = code6();
+  user.verify_exp = new Date(Date.now() + 24 * 3600e3).toISOString();
+  user.verify_tries = 0;
+  let via = 'approval';
+  if (st.verification === 'email' && mailReady()) {
+    const ok = await sendMail(user.email, 'Seu código da Lumix', mailBox('Confirme seu e-mail', user.verify_code, `Olá, ${user.display_name}! Use este código para liberar sua conta na Lumix:`));
+    if (ok) via = 'email';
+  }
+  user.verify_via = via;
+  save();
+  db.users.filter(isAdmin).forEach((a) => io.to(`user:${a.id}`).emit('admin:signup', { name: user.display_name, username: user.username, via }));
+  // o código nunca aparece para a equipe: vai só por e-mail; sem e-mail, a equipe libera pelo botão
+}
+
+app.post('/api/auth/register', async (req, res) => {
+  if (settings().signups_open === false && db.users.length) return bad(res, 'Os cadastros estão fechados no momento.', 403);
   const display_name = cleanStr(req.body.display_name, 32);
   const email = cleanStr(req.body.email, 120).toLowerCase();
   const password = String(req.body.password || '');
@@ -618,8 +720,63 @@ app.post('/api/auth/register', (req, res) => {
   } else username = makeUsername(display_name);
   const user = { id: id(), email, username, display_name, avatar_url: '', password: hashPassword(password), created_at: now() };
   db.users.push(user);
+  // a primeira conta é a dona e entra direto; as outras dependem da verificação escolhida no painel
+  if (db.users.length > 1 && settings().verification !== 'off') { user.status = 'pending'; await startVerification(user); }
   setSession(req, res, user.id);
   res.json(publicUser(user));
+});
+app.post('/api/auth/verify', auth, (req, res) => {
+  const u = req.user;
+  if (u.status !== 'pending') return res.json(publicUser(u));
+  if (new Date(u.verify_exp || 0) < new Date()) return bad(res, 'O código venceu. Peça um novo.');
+  u.verify_tries = (u.verify_tries || 0) + 1;
+  if (u.verify_tries > 8) return bad(res, 'Muitas tentativas. Peça um novo código.', 429);
+  if (String(req.body.code || '').replace(/\D/g, '') !== u.verify_code) { save(); return bad(res, 'Código incorreto.'); }
+  u.status = 'active'; u.email_verified = u.verify_via === 'email'; delete u.verify_code; delete u.verify_exp;
+  save();
+  res.json(publicUser(u));
+});
+const resendRate = new Map();
+app.post('/api/auth/resend', auth, async (req, res) => {
+  if (req.user.status !== 'pending') return res.json({ ok: true });
+  const last = resendRate.get(req.user.id) || 0;
+  if (Date.now() - last < 60e3) return bad(res, 'Espere um minuto para pedir de novo.', 429);
+  resendRate.set(req.user.id, Date.now());
+  await startVerification(req.user);
+  res.json({ ok: true, via: req.user.verify_via });
+});
+
+// esqueci a senha: código por e-mail (se configurado) ou gerado pelo dono no painel
+const forgotRate = new Map();
+app.post('/api/auth/forgot', async (req, res) => {
+  const email = cleanStr(req.body.email, 120).toLowerCase();
+  const t = Date.now();
+  if (t - (forgotRate.get(email) || 0) < 60e3) return bad(res, 'Espere um minuto para pedir de novo.', 429);
+  forgotRate.set(email, t);
+  const u = db.users.find((x) => x.email === email);
+  const mail = mailReady();
+  if (u && mail) {
+    u.reset_code = code6(); u.reset_exp = new Date(t + 30 * 60e3).toISOString(); u.reset_tries = 0; save();
+    await sendMail(u.email, 'Recuperar senha da Lumix', mailBox('Recuperar senha', u.reset_code, 'Use este código para criar uma senha nova. Ele vale por 30 minutos.'));
+  }
+  res.json({ ok: true, via: mail ? 'email' : 'off' });
+});
+app.post('/api/auth/reset', (req, res) => {
+  const email = cleanStr(req.body.email, 120).toLowerCase();
+  const u = db.users.find((x) => x.email === email);
+  if (!mailReady() || !u || !u.reset_code || new Date(u.reset_exp || 0) < new Date()) return bad(res, 'Código inválido ou vencido.');
+  u.reset_tries = (u.reset_tries || 0) + 1;
+  if (u.reset_tries > 8) { delete u.reset_code; save(); return bad(res, 'Muitas tentativas. Peça um código novo.', 429); }
+  if (String(req.body.code || '').replace(/\D/g, '') !== u.reset_code) { save(); return bad(res, 'Código incorreto.'); }
+  if (String(req.body.password || '').length < 6) return bad(res, 'A nova senha precisa ter pelo menos 6 caracteres.');
+  u.password = hashPassword(String(req.body.password));
+  u.email_verified = true;
+  delete u.reset_code; delete u.reset_exp;
+  const gone = db.sessions.filter((x) => x.user_id === u.id);
+  db.sessions = db.sessions.filter((x) => x.user_id !== u.id);
+  save(); kickSessions(gone.map((x) => x.token));
+  setSession(req, res, u.id);
+  res.json(publicUser(u));
 });
 const loginTickets = new Map(); // ticket -> { user_id, exp }
 const loginFails = new Map();
@@ -634,7 +791,7 @@ app.post('/api/auth/login', (req, res) => {
     return bad(res, user ? 'Senha incorreta.' : 'Não existe conta com esse e-mail. Confira ou clique em Cadastre-se.', 401);
   }
   loginFails.delete(key);
-  if (user.banned) return bad(res, 'Esta conta foi suspensa por violar as regras.', 403);
+  if (user.banned || isSuspended(user)) return bad(res, blockedMsg(user), 403);
   if (user.totp_secret) {
     const ticket = crypto.randomBytes(18).toString('hex');
     loginTickets.set(ticket, { user_id: user.id, exp: Date.now() + 5 * 60e3, tries: 0 });
@@ -653,7 +810,7 @@ app.post('/api/auth/2fa', (req, res) => {
   }
   loginTickets.delete(req.body.ticket);
   save();
-  setSession(req, res, user.id);
+  setSession(req, res, user.id, { mfa: true });
   res.json(publicUser(user));
 });
 app.post('/api/auth/logout', (req, res) => {
@@ -716,7 +873,7 @@ app.post('/api/me/password', auth, (req, res) => {
 // ---- servidores
 function serverPayload(s, uid) {
   return { id: s.id, name: s.name, color: s.color, icon_url: s.icon_url, invite_code: s.invite_code, owner_id: s.owner_id,
-    categories: s.categories, default_role_id: s.default_role_id || null, is_owner: s.owner_id === uid, perms: permsOf(s.id, uid) };
+    categories: s.categories, default_role_id: s.default_role_id || null, is_owner: s.owner_id === uid, perms: permsOf(s.id, uid), suspended: !!s.suspended };
 }
 function refresh(sid) { io.to(`server:${sid}`).emit('server:refresh', { server_id: sid }); }
 
@@ -749,6 +906,7 @@ app.post('/api/servers', auth, (req, res) => {
 function requireMember(req, res) {
   const s = serverById(req.params.sid);
   if (!s || !isMember(s.id, req.user.id)) { bad(res, 'Servidor não encontrado.', 404); return null; }
+  if (s.suspended && !/\/leave$/.test(req.path)) { bad(res, 'Esta comunidade foi suspensa pela equipe da Lumix por violar as regras.', 403); return null; }
   return s;
 }
 function requirePerm(req, res, perm) {
@@ -1335,6 +1493,7 @@ app.post('/api/2fa/enable', auth, (req, res) => {
   if (!sec) return bad(res, 'Comece a configuração de novo.');
   if (!checkTotp(sec, req.body.code)) return bad(res, 'Código incorreto. Confira o relógio do celular e tente de novo.');
   req.user.totp_secret = sec; delete req.user.totp_pending;
+  req.session.mfa = true;
   const codes = Array.from({ length: 8 }, () => crypto.randomBytes(4).toString('hex').replace(/(.{4})/, '$1-'));
   req.user.backup_codes = codes.map(hashCode);
   save();
@@ -1345,6 +1504,7 @@ app.post('/api/2fa/disable', auth, (req, res) => {
   if (!checkPassword(String(req.body.password || ''), req.user.password)) return bad(res, 'Senha incorreta.');
   if (!checkSecondFactor(req.user, req.body.code)) return bad(res, 'Código incorreto.');
   delete req.user.totp_secret; delete req.user.backup_codes;
+  db.sessions.filter((x) => x.user_id === req.user.id).forEach((x) => { delete x.mfa; });
   save();
   res.json({ ok: true });
 });
@@ -1392,37 +1552,535 @@ app.post('/api/reports', auth, (req, res) => {
   if (type === 'message') {
     const m = db.messages.find((x) => x.id === req.body.target) || db.dm_messages.find((x) => x.id === req.body.target);
     if (!m) return bad(res, 'Mensagem não encontrada.', 404);
-    r.target = m.id; r.target_user = m.author_id; r.snapshot = { content: m.content, attachments: m.attachments || [], created_at: m.created_at, where: m.channel_id ? 'canal' : 'conversa privada' };
+    r.target = m.id; r.target_user = m.author_id; r.snapshot = { content: m.content, attachments: m.attachments || [], created_at: m.created_at, where: m.channel_id ? 'canal' : 'conversa privada', server_id: m.channel_id ? channelById(m.channel_id)?.server_id : undefined };
   }
   if (type === 'user') {
     const u = userById(String(req.body.target || ''));
     if (!u) return bad(res, 'Pessoa não encontrada.', 404);
     r.target = u.id; r.target_user = u.id;
   }
+  if (type === 'server') {
+    const sv = serverById(String(req.body.target || ''));
+    if (!sv || !isMember(sv.id, req.user.id)) return bad(res, 'Comunidade não encontrada.', 404);
+    r.target = sv.id; r.target_server = sv.id; r.target_user = sv.owner_id;
+  }
   db.reports.push(r); save();
   db.users.filter(isAdmin).forEach((a) => io.to(`user:${a.id}`).emit('admin:report'));
   res.json({ ok: true });
 });
-function requireAdmin(req, res) { if (!isAdmin(req.user)) { bad(res, 'Só a equipe da Lumix pode ver isso.', 403); return false; } return true; }
-app.get('/api/admin/reports', auth, (req, res) => {
-  if (!requireAdmin(req, res)) return;
-  res.json(db.reports.slice().reverse().slice(0, 200).map((r) => ({ ...r, reporter_user: personOf(userById(r.reporter)), target_person: r.target_user ? { ...personOf(userById(r.target_user)), banned: !!userById(r.target_user)?.banned } : null })));
+// =============================================================== área administrativa
+// Cargos da equipe da plataforma: Dono (3) > Administrador (2) > Moderador (1).
+// Toda rota /api/admin passa por staffOnly(): login + cargo + verificação em duas etapas.
+const STAFF_LABEL = { 3: 'Dono', 2: 'Administrador', 1: 'Moderador', 0: 'Membro' };
+function staffOnly(min = 1) {
+  return (req, res, next) => auth(req, res, () => {
+    const rank = rankOf(req.user);
+    if (rank < min) return bad(res, rank ? 'Seu cargo não permite fazer isso.' : 'Acesso restrito à equipe da Lumix.', 403);
+    if (!req.user.totp_secret) return res.status(403).json({ error: 'Ative a verificação em duas etapas para usar a área administrativa.', need_2fa: 'setup' });
+    if (!req.session.mfa) return res.status(403).json({ error: 'Por segurança, saia e entre de novo usando o código de duas etapas.', need_2fa: 'relogin' });
+    req.rank = rank;
+    next();
+  });
+}
+function paginate(list, q) {
+  const per = Math.min(50, Math.max(5, Number(q.per) || 20));
+  const pages = Math.max(1, Math.ceil(list.length / per));
+  const page = Math.min(pages, Math.max(1, Number(q.page) || 1));
+  return { items: list.slice((page - 1) * per, page * per), total: list.length, page, pages, per };
+}
+// registro de ações: só acrescenta, nunca apaga
+function audit(req, action, target, reason = '', details = '') {
+  db.audit.push({ id: id(), at: now(), actor: req.user.id, actor_name: req.user.display_name, actor_role: STAFF_LABEL[rankOf(req.user)],
+    action, target_type: target?.type || '', target_id: target?.id || '', target_label: target?.label || '', reason: String(reason || '').slice(0, 500), details: String(details || '').slice(0, 300) });
+  save();
+}
+const userLabel = (u) => (u ? `${u.display_name} (@${u.username})` : '?');
+const needReason = (req, res) => {
+  const r = cleanStr(req.body.reason, 500);
+  if (r.length < 3) { bad(res, 'Escreva o motivo (pelo menos 3 letras).'); return null; }
+  return r;
+};
+function emailState(u) {
+  if (u.status === 'pending') return 'aguardando';
+  return u.email_verified ? 'confirmado' : 'nao_confirmado';
+}
+function restrictionOf(u) {
+  if (u.banned) return { state: 'banido', reason: u.ban_reason || '', until: null };
+  if (isSuspended(u)) return { state: 'suspenso', reason: u.suspend_reason || '', until: u.suspended_until };
+  if (u.status === 'pending') return { state: 'pendente' };
+  return { state: 'ativo' };
+}
+function staffRow(u) {
+  const last = db.sessions.filter((x) => x.user_id === u.id).map((x) => x.last_seen || '').sort().pop() || '';
+  return { ...personOf(u), email: u.email, created_at: u.created_at, staff_role: STAFF_LABEL[rankOf(u)], rank: rankOf(u),
+    restriction: restrictionOf(u), email_state: emailState(u), two_factor: !!u.totp_secret, last_seen: last,
+    warnings: (u.warnings || []).length, servers: db.members.filter((m) => m.user_id === u.id).length };
+}
+function endSessions(u) {
+  const gone = db.sessions.filter((x) => x.user_id === u.id);
+  db.sessions = db.sessions.filter((x) => x.user_id !== u.id);
+  kickSessions(gone.map((x) => x.token));
+}
+function canActOn(req, res, u) {
+  if (!u) { bad(res, 'Conta não encontrada.', 404); return false; }
+  if (u.id === req.user.id) { bad(res, 'Você não pode aplicar isso na sua própria conta.'); return false; }
+  if (rankOf(u) >= req.rank) { bad(res, 'Você não pode agir sobre alguém do mesmo cargo ou de cargo acima do seu.', 403); return false; }
+  return true;
+}
+const staffIds = () => db.users.filter((u) => rankOf(u) > 0).map((u) => u.id);
+const toStaff = (ev, data) => staffIds().forEach((x) => io.to(`user:${x}`).emit(ev, data || {}));
+
+// punições em uma conta (usado pelo menu do usuário e pela fila de denúncias)
+function moderateUser(req, res, u, action, reason, days) {
+  if (!canActOn(req, res, u)) return null;
+  if (action === 'warn') {
+    (u.warnings ||= []).push({ id: id(), at: now(), by: req.user.id, reason });
+    (u.notices ||= []).push({ id: id(), type: 'warn', reason, at: now() });
+    io.to(`user:${u.id}`).emit('notice', { type: 'warn', reason });
+    audit(req, 'Advertiu a conta', { type: 'user', id: u.id, label: userLabel(u) }, reason);
+  } else if (action === 'suspend') {
+    const d = Math.round(Number(days));
+    if (!(d >= 1 && d <= 365)) { bad(res, 'Escolha de 1 a 365 dias de suspensão.'); return null; }
+    if (req.rank < 2 && d > 7) { bad(res, 'Moderadores podem suspender por no máximo 7 dias.', 403); return null; }
+    u.suspended_until = new Date(Date.now() + d * 864e5).toISOString(); u.suspend_reason = reason;
+    endSessions(u);
+    audit(req, `Suspendeu a conta por ${d} dia(s)`, { type: 'user', id: u.id, label: userLabel(u) }, reason);
+  } else if (action === 'ban') {
+    if (req.rank < 2) { bad(res, 'Só administradores podem banir.', 403); return null; }
+    u.banned = true; u.ban_reason = reason;
+    endSessions(u);
+    audit(req, 'Baniu a conta', { type: 'user', id: u.id, label: userLabel(u) }, reason);
+  } else if (action === 'reactivate') {
+    if (u.banned && req.rank < 2) { bad(res, 'Só administradores podem tirar um banimento.', 403); return null; }
+    if (!u.banned && !isSuspended(u)) { bad(res, 'Essa conta já está ativa.'); return null; }
+    u.banned = false; delete u.ban_reason; delete u.suspended_until; delete u.suspend_reason;
+    audit(req, 'Reativou a conta', { type: 'user', id: u.id, label: userLabel(u) }, reason);
+  } else { bad(res, 'Ação inválida.'); return null; }
+  save();
+  return true;
+}
+
+// contadores para o selo do escudo (não exige 2 etapas: só números)
+app.get('/api/admin/ping', auth, (req, res) => {
+  if (!rankOf(req.user)) return bad(res, 'Acesso restrito à equipe da Lumix.', 403);
+  res.json({ pending: db.users.filter((u) => u.status === 'pending').length, reports: db.reports.filter((r) => ['aberta', 'analise'].includes(r.status)).length,
+    support: db.tickets.filter((t) => t.status === 'aberto').length, ready: !!req.user.totp_secret && !!req.session.mfa, two_factor: !!req.user.totp_secret });
 });
-app.patch('/api/admin/reports/:rid', auth, (req, res) => {
-  if (!requireAdmin(req, res)) return;
-  const r = db.reports.find((x) => x.id === req.params.rid);
-  if (!r) return bad(res, 'Não encontrada.', 404);
-  if (['aberta', 'resolvida', 'descartada'].includes(req.body.status)) r.status = req.body.status;
-  save(); res.json(r);
+
+app.get('/api/admin/overview', staffOnly(1), (req, res) => {
+  const t = Date.now(), day = new Date(t - 864e5).toISOString(), week = new Date(t - 7 * 864e5).toISOString(), twoWeeks = new Date(t - 14 * 864e5).toISOString();
+  const online = new Set([...io.sockets.sockets.values()].map((x) => x.data.user?.id).filter(Boolean)).size;
+  const series = [];
+  for (let i = 6; i >= 0; i--) {
+    const d = new Date(t - i * 864e5); const key = d.toISOString().slice(0, 10);
+    series.push({ day: key, count: db.users.filter((u) => (u.created_at || '').slice(0, 10) === key).length });
+  }
+  res.json({
+    stats: {
+      users: db.users.length, online, new_today: db.users.filter((u) => u.created_at > day).length,
+      new_week: db.users.filter((u) => u.created_at > week).length, new_prev_week: db.users.filter((u) => u.created_at > twoWeeks && u.created_at <= week).length,
+      suspended: db.users.filter((u) => isSuspended(u)).length, banned: db.users.filter((u) => u.banned).length,
+      pending: db.users.filter((u) => u.status === 'pending').length,
+      communities: db.servers.length, communities_suspended: db.servers.filter((s) => s.suspended).length,
+      reports_open: db.reports.filter((r) => ['aberta', 'analise'].includes(r.status)).length,
+      support_open: db.tickets.filter((x) => x.status !== 'resolvido').length,
+      in_calls: [...voice.values()].reduce((n, r) => n + r.size, 0),
+    },
+    series,
+    recent_users: db.users.slice(-5).reverse().map(staffRow),
+    recent_actions: db.audit.slice(-5).reverse(),
+    settings: settings(), me: { rank: req.rank, role: STAFF_LABEL[req.rank] },
+    mail_ready: mailReady(), storage: store ? 'MongoDB (salva de vez)' : 'Disco temporário (apaga quando o site reinicia)',
+    ai: process.env.ANTHROPIC_API_KEY ? 'Claude' : process.env.GEMINI_API_KEY ? 'Gemini' : 'Assistente básico',
+    turn: process.env.CF_TURN_KEY_ID ? 'Cloudflare' : process.env.METERED_API_KEY ? 'Metered' : process.env.ICE_SERVERS ? 'Personalizado' : 'Open Relay (público)',
+  });
 });
-app.post('/api/admin/users/:uid/ban', auth, (req, res) => {
-  if (!requireAdmin(req, res)) return;
+
+// ---- usuários
+app.get('/api/admin/users', staffOnly(1), (req, res) => {
+  const q = String(req.query.q || '').toLowerCase().trim().replace(/^@/, '');
+  const f = String(req.query.filter || '');
+  let list = db.users.slice().reverse();
+  if (f === 'pending') list = list.filter((u) => u.status === 'pending');
+  if (f === 'suspended') list = list.filter((u) => isSuspended(u));
+  if (f === 'banned') list = list.filter((u) => u.banned);
+  if (f === 'staff') list = list.filter((u) => rankOf(u) > 0);
+  if (f === 'warned') list = list.filter((u) => (u.warnings || []).length);
+  if (q) list = list.filter((u) => u.id === q || [u.display_name, u.username, u.email].some((x) => String(x || '').toLowerCase().includes(q)));
+  const pg = paginate(list, req.query);
+  res.json({ ...pg, items: pg.items.map(staffRow) });
+});
+app.get('/api/admin/users/:uid', staffOnly(1), (req, res) => {
   const u = userById(req.params.uid);
-  if (!u || isAdmin(u)) return bad(res, 'Não dá para suspender essa conta.');
-  u.banned = !!req.body.banned;
-  if (u.banned) { const gone = db.sessions.filter((x) => x.user_id === u.id); db.sessions = db.sessions.filter((x) => x.user_id !== u.id); kickSessions(gone.map((x) => x.token)); }
-  save(); res.json({ ok: true, banned: u.banned });
+  if (!u) return bad(res, 'Conta não encontrada.', 404);
+  res.json({
+    ...staffRow(u), bio: u.bio || '', verify_via: u.verify_via || '',
+    warnings_list: (u.warnings || []).slice().reverse().map((w) => ({ ...w, by_name: userById(w.by)?.display_name || '?' })),
+    reports_against: db.reports.filter((r) => r.target_user === u.id).length,
+    reports_sent: db.reports.filter((r) => r.reporter === u.id).length,
+    owned_servers: db.servers.filter((s) => s.owner_id === u.id).map((s) => ({ id: s.id, name: s.name, suspended: !!s.suspended })),
+    sessions: db.sessions.filter((x) => x.user_id === u.id).length,
+    history: db.audit.filter((a) => a.target_id === u.id).slice(-30).reverse(),
+  });
 });
+app.post('/api/admin/users/:uid/moderate', staffOnly(1), (req, res) => {
+  const u = userById(req.params.uid);
+  const action = String(req.body.action || '');
+  const reason = needReason(req, res); if (reason === null) return;
+  if (!moderateUser(req, res, u, action, reason, req.body.days)) return;
+  res.json(staffRow(u));
+});
+app.post('/api/admin/users/:uid/approve', staffOnly(1), (req, res) => {
+  const u = userById(req.params.uid);
+  if (!u || u.status !== 'pending') return bad(res, 'Esse cadastro não está esperando liberação.', 404);
+  u.status = 'active'; delete u.verify_code; delete u.verify_exp;
+  save(); io.to(`user:${u.id}`).emit('account:approved');
+  audit(req, 'Liberou o cadastro', { type: 'user', id: u.id, label: userLabel(u) });
+  res.json({ ok: true });
+});
+app.post('/api/admin/users/:uid/role', staffOnly(2), (req, res) => {
+  const u = userById(req.params.uid);
+  const role = String(req.body.role || '');
+  if (!['admin', 'mod', 'member'].includes(role)) return bad(res, 'Cargo inválido.');
+  if (!u) return bad(res, 'Conta não encontrada.', 404);
+  if (isOwnerUser(u)) return bad(res, 'O cargo de Dono não pode ser alterado.', 403);
+  if (u.id === req.user.id) return bad(res, 'Você não pode mudar o próprio cargo.');
+  if (role === 'admin' && req.rank < 3) return bad(res, 'Só o Dono pode promover administradores.', 403);
+  if (rankOf(u) >= req.rank) return bad(res, 'Você não pode alterar alguém do mesmo cargo ou acima.', 403);
+  if (u.status === 'pending' || u.banned) return bad(res, 'Libere ou reative a conta antes de dar um cargo.');
+  const before = STAFF_LABEL[rankOf(u)];
+  if (role === 'member') delete u.role; else u.role = role;
+  const reason = cleanStr(req.body.reason, 500);
+  audit(req, `Mudou o cargo: ${before} → ${STAFF_LABEL[rankOf(u)]}`, { type: 'user', id: u.id, label: userLabel(u) }, reason);
+  io.to(`user:${u.id}`).emit('me:refresh');
+  res.json(staffRow(u));
+});
+function wipeUser(u) {
+  endSessions(u);
+  db.servers.filter((sv) => sv.owner_id === u.id).map((sv) => sv.id).forEach((sid) => {
+    const chIds = db.channels.filter((c) => c.server_id === sid).map((c) => c.id);
+    removeUploads(attIds(db.messages.filter((m) => chIds.includes(m.channel_id))));
+    db.messages = db.messages.filter((m) => !chIds.includes(m.channel_id));
+    db.channels = db.channels.filter((c) => c.server_id !== sid);
+    db.roles = db.roles.filter((r) => r.server_id !== sid);
+    db.members = db.members.filter((m) => m.server_id !== sid);
+    db.servers = db.servers.filter((x) => x.id !== sid);
+    io.to(`server:${sid}`).emit('server:deleted', { id: sid });
+  });
+  db.members = db.members.filter((m) => m.user_id !== u.id);
+  db.friends = db.friends.filter((f) => f.from !== u.id && f.to !== u.id);
+  db.blocks = db.blocks.filter((b) => b.blocker !== u.id && b.blocked !== u.id);
+  db.users = db.users.filter((x) => x.id !== u.id);
+}
+// recusar cadastro pendente (Administrador+) ou excluir conta de vez (só o Dono)
+app.delete('/api/admin/users/:uid', staffOnly(2), (req, res) => {
+  const u = userById(req.params.uid);
+  if (!u) return bad(res, 'Conta não encontrada.', 404);
+  const reason = needReason(req, res); if (reason === null) return;
+  if (u.status !== 'pending' && req.rank < 3) return bad(res, 'Só o Dono pode excluir contas.', 403);
+  if (!canActOn(req, res, u)) return;
+  const label = userLabel(u), pend = u.status === 'pending';
+  wipeUser(u);
+  audit(req, pend ? 'Recusou o cadastro' : 'Excluiu a conta', { type: 'user', id: u.id, label }, reason);
+  res.json({ ok: true });
+});
+
+// ---- denúncias
+const REPORT_STATES = ['aberta', 'analise', 'resolvida', 'arquivada'];
+function reportRow(r, full) {
+  const tu = r.target_user ? userById(r.target_user) : null;
+  const out = { ...r, status: r.status === 'descartada' ? 'arquivada' : r.status,
+    reporter_user: personOf(userById(r.reporter)), target_person: tu ? { ...personOf(tu), restriction: restrictionOf(tu), rank: rankOf(tu) } : null,
+    target_server: r.target_server ? (() => { const s = serverById(r.target_server); return s ? { id: s.id, name: s.name, suspended: !!s.suspended } : { id: r.target_server, name: '(apagada)' }; })() : null };
+  if (full && r.type === 'message' && r.snapshot?.where === 'canal') {
+    // contexto: poucas mensagens em volta, só do canal da comunidade (nunca de conversa privada)
+    const m = db.messages.find((x) => x.id === r.target);
+    if (m) {
+      const all = db.messages.filter((x) => x.channel_id === m.channel_id);
+      const i = all.indexOf(m);
+      out.context = all.slice(Math.max(0, i - 4), i + 5).map((x) => ({ id: x.id, author: userById(x.author_id)?.display_name || '?', content: String(x.content || '').slice(0, 400), at: x.created_at, target: x.id === m.id }));
+      const c = channelById(m.channel_id), s = c && serverById(c.server_id);
+      out.where = s ? `#${c.name} em ${s.name}` : '';
+    } else out.message_gone = true;
+  }
+  if (full && r.type === 'message' && r.snapshot?.where === 'conversa privada') {
+    out.private_note = 'Conversa privada: por privacidade, só a mensagem denunciada é mostrada.';
+    out.message_gone = !db.dm_messages.some((x) => x.id === r.target);
+  }
+  if (full) out.history = db.audit.filter((a) => a.target_id === r.id).reverse();
+  return out;
+}
+app.get('/api/admin/reports', staffOnly(1), (req, res) => {
+  const st = String(req.query.status || 'pendentes');
+  let list = db.reports.slice().reverse();
+  if (st === 'pendentes') list = list.filter((r) => ['aberta', 'analise'].includes(r.status));
+  else if (REPORT_STATES.includes(st)) list = list.filter((r) => (r.status === 'descartada' ? 'arquivada' : r.status) === st);
+  const type = String(req.query.type || '');
+  if (type) list = list.filter((r) => r.type === type);
+  const pg = paginate(list, req.query);
+  res.json({ ...pg, items: pg.items.map((r) => reportRow(r, false)) });
+});
+app.get('/api/admin/reports/:rid', staffOnly(1), (req, res) => {
+  const r = db.reports.find((x) => x.id === req.params.rid);
+  if (!r) return bad(res, 'Denúncia não encontrada.', 404);
+  res.json(reportRow(r, true));
+});
+app.patch('/api/admin/reports/:rid', staffOnly(1), (req, res) => {
+  const r = db.reports.find((x) => x.id === req.params.rid);
+  if (!r) return bad(res, 'Denúncia não encontrada.', 404);
+  const st = String(req.body.status || '');
+  if (!REPORT_STATES.includes(st)) return bad(res, 'Estado inválido.');
+  const note = cleanStr(req.body.note, 500);
+  if (st === 'arquivada' && note.length < 3) return bad(res, 'Escreva o motivo para arquivar.');
+  r.status = st; r.handled_by = req.user.id; r.updated_at = now();
+  audit(req, { analise: 'Pegou a denúncia para análise', arquivada: 'Arquivou a denúncia', resolvida: 'Marcou a denúncia como resolvida', aberta: 'Reabriu a denúncia' }[st],
+    { type: 'report', id: r.id, label: `Denúncia: ${r.reason || r.type}` }, note);
+  res.json(reportRow(r, true));
+});
+app.post('/api/admin/reports/:rid/action', staffOnly(1), (req, res) => {
+  const r = db.reports.find((x) => x.id === req.params.rid);
+  if (!r) return bad(res, 'Denúncia não encontrada.', 404);
+  const action = String(req.body.action || '');
+  const reason = needReason(req, res); if (reason === null) return;
+  let done = '';
+  if (action === 'delete_message') {
+    if (r.type !== 'message') return bad(res, 'Essa denúncia não é de mensagem.');
+    const m = db.messages.find((x) => x.id === r.target);
+    const dm = db.dm_messages.find((x) => x.id === r.target);
+    if (m) {
+      db.messages = db.messages.filter((x) => x.id !== m.id); removeUploads(attIds([m]));
+      const c = channelById(m.channel_id); if (c) emitToChannel(c, 'message:deleted', { id: m.id, channel_id: m.channel_id });
+    } else if (dm) {
+      db.dm_messages = db.dm_messages.filter((x) => x.id !== dm.id); removeUploads(attIds([dm]));
+      db.dms.find((d) => d.id === dm.dm_id)?.user_ids.forEach((x) => io.to(`user:${x}`).emit('dm:deleted', { id: dm.id, dm_id: dm.dm_id }));
+    } else return bad(res, 'A mensagem já foi apagada.');
+    audit(req, 'Apagou a mensagem denunciada', { type: 'report', id: r.id, label: `Mensagem de ${userLabel(userById(r.target_user))}` }, reason);
+    done = 'Mensagem apagada.';
+  } else if (['warn', 'suspend', 'ban'].includes(action)) {
+    const u = userById(r.target_user);
+    if (!moderateUser(req, res, u, action, reason, req.body.days)) return;
+    done = 'Punição aplicada.';
+  } else if (action === 'suspend_server') {
+    if (req.rank < 2) return bad(res, 'Só administradores suspendem comunidades.', 403);
+    const s = serverById(r.target_server);
+    if (!s) return bad(res, 'Comunidade não encontrada.', 404);
+    suspendServer(req, s, true, reason);
+    done = 'Comunidade suspensa.';
+  } else return bad(res, 'Ação inválida.');
+  r.status = 'resolvida'; r.handled_by = req.user.id; r.updated_at = now(); r.action_taken = action;
+  audit(req, 'Resolveu a denúncia aplicando uma ação', { type: 'report', id: r.id, label: `Denúncia: ${r.reason || r.type}` }, reason, action);
+  res.json({ ok: true, message: done, report: reportRow(r, true) });
+});
+
+// ---- comunidades
+function communityRow(s) {
+  const owner = userById(s.owner_id);
+  return { id: s.id, name: s.name, color: s.color, icon_url: s.icon_url, created_at: s.created_at, suspended: !!s.suspended, suspend_reason: s.suspend_reason || '',
+    owner: owner ? { ...personOf(owner), email: undefined } : null, members: db.members.filter((m) => m.server_id === s.id).length,
+    channels: db.channels.filter((c) => c.server_id === s.id).length, reports: db.reports.filter((r) => r.target_server === s.id || (r.snapshot?.server_id === s.id)).length };
+}
+function suspendServer(req, s, on, reason) {
+  s.suspended = !!on;
+  if (on) { s.suspend_reason = reason; s.suspended_at = now(); } else { delete s.suspend_reason; delete s.suspended_at; }
+  save();
+  if (on) { const chIds = db.channels.filter((c) => c.server_id === s.id).map((c) => c.id); for (const [, sk] of io.sockets.sockets) if (chIds.includes(sk.data.voice)) leaveVoice(sk); }
+  io.to(`server:${s.id}`).emit('server:refresh', { server_id: s.id });
+  io.to(`server:${s.id}`).emit('server:suspended', { server_id: s.id, suspended: !!on });
+  audit(req, on ? 'Suspendeu a comunidade' : 'Reativou a comunidade', { type: 'server', id: s.id, label: s.name }, reason);
+}
+app.get('/api/admin/communities', staffOnly(1), (req, res) => {
+  const q = String(req.query.q || '').toLowerCase().trim();
+  let list = db.servers.slice().reverse();
+  if (req.query.filter === 'suspended') list = list.filter((s) => s.suspended);
+  if (req.query.filter === 'reported') list = list.filter((s) => communityRow(s).reports > 0);
+  if (q) list = list.filter((s) => s.id === q || s.name.toLowerCase().includes(q) || (userById(s.owner_id)?.username || '').includes(q));
+  const pg = paginate(list, req.query);
+  res.json({ ...pg, items: pg.items.map(communityRow) });
+});
+app.get('/api/admin/communities/:sid', staffOnly(1), (req, res) => {
+  const s = serverById(req.params.sid);
+  if (!s) return bad(res, 'Comunidade não encontrada.', 404);
+  const cats = Object.fromEntries((s.categories || []).map((c) => [c.id, c.name]));
+  res.json({
+    ...communityRow(s),
+    // só a estrutura: nomes e tipos dos canais, sem as mensagens
+    channel_list: db.channels.filter((c) => c.server_id === s.id).sort((a, b) => (a.position || 0) - (b.position || 0))
+      .map((c) => ({ id: c.id, name: c.name, kind: c.kind, category: cats[c.category_id] || '', private: !!c.allowed_roles?.length, read_only: !!c.read_only,
+        messages: c.kind === 'text' ? db.messages.filter((m) => m.channel_id === c.id).length : undefined })),
+    roles: serverRoles(s.id).map((r) => ({ name: r.name, color: r.color, admin: !!r.perms?.admin })),
+    staff: db.members.filter((m) => m.server_id === s.id && (s.owner_id === m.user_id || permsOf(s.id, m.user_id).admin)).map((m) => personOf(userById(m.user_id))).filter(Boolean),
+    reports_list: db.reports.filter((r) => r.target_server === s.id || r.snapshot?.server_id === s.id).slice(-20).reverse().map((r) => reportRow(r, false)),
+    history: db.audit.filter((a) => a.target_id === s.id).slice(-20).reverse(),
+  });
+});
+app.post('/api/admin/communities/:sid/suspend', staffOnly(2), (req, res) => {
+  const s = serverById(req.params.sid);
+  if (!s) return bad(res, 'Comunidade não encontrada.', 404);
+  const reason = needReason(req, res); if (reason === null) return;
+  const on = !!req.body.suspended;
+  if (!!s.suspended === on) return bad(res, on ? 'Essa comunidade já está suspensa.' : 'Essa comunidade já está ativa.');
+  suspendServer(req, s, on, reason);
+  res.json(communityRow(s));
+});
+
+// ---- atualizações (canal oficial "Novidades da Lumix")
+const UPDATE_KINDS = ['novidade', 'correcao', 'aviso'];
+function updateRow(x) { return { ...x, author_name: userById(x.author)?.display_name || 'Equipe Lumix' }; }
+function cleanUpdate(req, res) {
+  const title = cleanStr(req.body.title, 100), text = cleanStr(req.body.text, 5000), version = cleanStr(req.body.version, 20);
+  if (title.length < 3) { bad(res, 'Dê um título (pelo menos 3 letras).'); return null; }
+  if (text.length < 5) { bad(res, 'Escreva o texto da atualização.'); return null; }
+  if (version && !/^[\w.\- ]+$/.test(version)) { bad(res, 'Versão inválida. Use algo como 1.2.0'); return null; }
+  const img = req.body.image_url || '';
+  if (img && !(typeof img === 'string' && /^data:image\/(png|jpe?g|webp|gif);base64,/.test(img) && img.length < 3_000_000)) { bad(res, 'Imagem inválida ou muito grande.'); return null; }
+  return { title, text, version, image_url: img, kind: UPDATE_KINDS.includes(req.body.kind) ? req.body.kind : 'novidade', pinned: !!req.body.pinned };
+}
+app.get('/api/updates', auth, (req, res) => {
+  const list = db.updates.slice().reverse().sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0));
+  res.json(list.slice(0, 50).map(updateRow));
+});
+app.post('/api/updates/seen', auth, (req, res) => { req.user.updates_seen = now(); save(); res.json({ ok: true }); });
+app.post('/api/admin/updates', staffOnly(2), (req, res) => {
+  const d = cleanUpdate(req, res); if (!d) return;
+  const x = { id: id(), ...d, author: req.user.id, created_at: now() };
+  db.updates.push(x);
+  audit(req, 'Publicou uma atualização', { type: 'update', id: x.id, label: x.title }, '', x.version ? `versão ${x.version}` : '');
+  io.emit('updates:new', { title: x.title });
+  res.json(updateRow(x));
+});
+app.patch('/api/admin/updates/:id', staffOnly(2), (req, res) => {
+  const x = db.updates.find((u) => u.id === req.params.id);
+  if (!x) return bad(res, 'Atualização não encontrada.', 404);
+  const d = cleanUpdate(req, res); if (!d) return;
+  Object.assign(x, d, { edited_at: now() });
+  audit(req, 'Editou uma atualização', { type: 'update', id: x.id, label: x.title });
+  res.json(updateRow(x));
+});
+app.delete('/api/admin/updates/:id', staffOnly(2), (req, res) => {
+  const x = db.updates.find((u) => u.id === req.params.id);
+  if (!x) return bad(res, 'Atualização não encontrada.', 404);
+  const reason = needReason(req, res); if (reason === null) return;
+  db.updates = db.updates.filter((u) => u !== x);
+  audit(req, 'Removeu uma atualização', { type: 'update', id: x.id, label: x.title }, reason);
+  res.json({ ok: true });
+});
+
+// ---- suporte
+const TICKET_STATES = ['aberto', 'atendimento', 'resolvido'];
+const SUPPORT_CATS = ['Conta e login', 'Chamadas', 'Mensagens', 'Comunidades', 'Denúncia', 'Sugestão', 'Outro'];
+function ticketRow(t, forStaff) {
+  const u = userById(t.user_id);
+  return { id: t.id, subject: t.subject, category: t.category, status: t.status, created_at: t.created_at, updated_at: t.updated_at,
+    user: u ? personOf(u) : { display_name: '(conta excluída)', username: '' }, count: t.messages.length,
+    last: t.messages[t.messages.length - 1]?.staff ? 'equipe' : 'usuario',
+    assigned: forStaff && t.assigned ? userById(t.assigned)?.display_name || '' : undefined };
+}
+function ticketFull(t, forStaff) {
+  return { ...ticketRow(t, forStaff), messages: t.messages.map((m) => ({ id: m.id, text: m.text, at: m.at, staff: !!m.staff,
+    author: m.staff ? (forStaff ? `${userById(m.author)?.display_name || 'Equipe'} (equipe)` : 'Equipe Lumix') : userById(m.author)?.display_name || '?' })),
+    history: forStaff ? t.history || [] : undefined };
+}
+const supRate = new Map();
+app.get('/api/support', auth, (req, res) => res.json(db.tickets.filter((t) => t.user_id === req.user.id).slice().reverse().map((t) => ticketRow(t))));
+app.post('/api/support', auth, (req, res) => {
+  const subject = cleanStr(req.body.subject, 100), text = cleanStr(req.body.text, 3000);
+  if (subject.length < 3) return bad(res, 'Escreva um assunto.');
+  if (text.length < 10) return bad(res, 'Conte com um pouco mais de detalhe (pelo menos 10 letras).');
+  const hits = (supRate.get(req.user.id) || []).filter((x) => Date.now() - x < 3600e3);
+  if (hits.length >= 5) return bad(res, 'Você abriu muitos pedidos. Espere um pouco ou responda num pedido aberto.', 429);
+  hits.push(Date.now()); supRate.set(req.user.id, hits);
+  const t = { id: id(), user_id: req.user.id, subject, category: SUPPORT_CATS.includes(req.body.category) ? req.body.category : 'Outro', status: 'aberto',
+    created_at: now(), updated_at: now(), messages: [{ id: id(), author: req.user.id, staff: false, text, at: now() }], history: [{ at: now(), text: 'Pedido aberto' }] };
+  db.tickets.push(t); save();
+  toStaff('admin:support', { subject });
+  res.json(ticketFull(t));
+});
+app.get('/api/support/:tid', auth, (req, res) => {
+  const t = db.tickets.find((x) => x.id === req.params.tid && x.user_id === req.user.id);
+  if (!t) return bad(res, 'Pedido não encontrado.', 404);
+  res.json(ticketFull(t));
+});
+app.post('/api/support/:tid/messages', auth, (req, res) => {
+  const t = db.tickets.find((x) => x.id === req.params.tid && x.user_id === req.user.id);
+  if (!t) return bad(res, 'Pedido não encontrado.', 404);
+  const text = cleanStr(req.body.text, 3000);
+  if (text.length < 2) return bad(res, 'Escreva a mensagem.');
+  t.messages.push({ id: id(), author: req.user.id, staff: false, text, at: now() });
+  if (t.status === 'resolvido') { t.status = 'aberto'; t.history.push({ at: now(), text: 'Reaberto pela pessoa' }); }
+  t.updated_at = now(); save();
+  toStaff('admin:support', { subject: t.subject });
+  res.json(ticketFull(t));
+});
+app.get('/api/admin/support', staffOnly(1), (req, res) => {
+  const st = String(req.query.status || '');
+  let list = db.tickets.slice().sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+  if (TICKET_STATES.includes(st)) list = list.filter((t) => t.status === st);
+  const pg = paginate(list, req.query);
+  res.json({ ...pg, items: pg.items.map((t) => ticketRow(t, true)), counts: Object.fromEntries(TICKET_STATES.map((s) => [s, db.tickets.filter((t) => t.status === s).length])) });
+});
+app.get('/api/admin/support/:tid', staffOnly(1), (req, res) => {
+  const t = db.tickets.find((x) => x.id === req.params.tid);
+  if (!t) return bad(res, 'Pedido não encontrado.', 404);
+  res.json(ticketFull(t, true));
+});
+app.post('/api/admin/support/:tid/reply', staffOnly(1), (req, res) => {
+  const t = db.tickets.find((x) => x.id === req.params.tid);
+  if (!t) return bad(res, 'Pedido não encontrado.', 404);
+  const text = cleanStr(req.body.text, 3000);
+  if (text.length < 2) return bad(res, 'Escreva a resposta.');
+  t.messages.push({ id: id(), author: req.user.id, staff: true, text, at: now() });
+  if (t.status === 'aberto') { t.status = 'atendimento'; t.history.push({ at: now(), text: `Em atendimento por ${req.user.display_name}` }); }
+  t.assigned ||= req.user.id; t.updated_at = now(); save();
+  io.to(`user:${t.user_id}`).emit('support:reply', { id: t.id, subject: t.subject });
+  audit(req, 'Respondeu um pedido de suporte', { type: 'ticket', id: t.id, label: t.subject });
+  res.json(ticketFull(t, true));
+});
+app.patch('/api/admin/support/:tid', staffOnly(1), (req, res) => {
+  const t = db.tickets.find((x) => x.id === req.params.tid);
+  if (!t) return bad(res, 'Pedido não encontrado.', 404);
+  const st = String(req.body.status || '');
+  if (!TICKET_STATES.includes(st)) return bad(res, 'Estado inválido.');
+  if (t.status === st) return res.json(ticketFull(t, true));
+  const label = { aberto: 'Aberto', atendimento: 'Em atendimento', resolvido: 'Resolvido' };
+  t.history.push({ at: now(), text: `${label[t.status]} → ${label[st]} por ${req.user.display_name}` });
+  t.status = st; t.updated_at = now(); if (st === 'atendimento') t.assigned = req.user.id;
+  save();
+  io.to(`user:${t.user_id}`).emit('support:reply', { id: t.id, subject: t.subject, status: st });
+  audit(req, `Mudou o suporte para "${label[st]}"`, { type: 'ticket', id: t.id, label: t.subject });
+  res.json(ticketFull(t, true));
+});
+
+// ---- registro de ações (somente leitura; não existe rota para apagar)
+app.get('/api/admin/audit', staffOnly(1), (req, res) => {
+  const q = String(req.query.q || '').toLowerCase().trim();
+  let list = db.audit.slice().reverse();
+  if (req.query.type) list = list.filter((a) => a.target_type === req.query.type);
+  if (q) list = list.filter((a) => [a.actor_name, a.action, a.target_label, a.reason].some((x) => String(x || '').toLowerCase().includes(q)));
+  res.json(paginate(list, req.query));
+});
+
+// ---- cargos da equipe
+app.get('/api/admin/staff', staffOnly(1), (req, res) => {
+  res.json(db.users.filter((u) => rankOf(u) > 0).sort((a, b) => rankOf(b) - rankOf(a)).map(staffRow));
+});
+
+// ---- configurações gerais (Administrador+)
+app.patch('/api/admin/settings', staffOnly(2), (req, res) => {
+  const st = settings();
+  const changes = [];
+  if (['off', 'approval', 'email'].includes(req.body.verification) && req.body.verification !== st.verification) { changes.push(`verificação: ${req.body.verification}`); st.verification = req.body.verification; }
+  if (req.body.signups_open !== undefined && !!req.body.signups_open !== (st.signups_open !== false)) { st.signups_open = !!req.body.signups_open; changes.push(`cadastros ${st.signups_open ? 'abertos' : 'fechados'}`); }
+  if (req.body.announcement !== undefined) {
+    const a = cleanStr(req.body.announcement, 280);
+    if (a !== (st.announcement || '')) { st.announcement = a; changes.push(a ? 'aviso geral atualizado' : 'aviso geral removido'); io.emit('announcement', { text: a }); }
+  }
+  save();
+  if (changes.length) audit(req, 'Alterou as configurações gerais', { type: 'settings', id: 'settings', label: 'Configurações' }, '', changes.join(', '));
+  res.json(st);
+});
+
+// avisos para a própria pessoa (advertências)
+app.post('/api/me/notices/seen', auth, (req, res) => { req.user.notices = []; save(); res.json({ ok: true }); });
 
 // perfil de outra pessoa
 app.get('/api/users/:uid', auth, (req, res) => {
@@ -1466,10 +2124,23 @@ app.post('/api/invite/:code/join', auth, (req, res) => {
 // Servidores para as chamadas atravessarem a internet (STUN + TURN).
 // Sem TURN, chamadas entre redes diferentes (4G, operadoras com CGNAT) ficam mudas ou com tela preta.
 let meteredCache = { at: 0, list: null };
+let cfCache = {};
 async function iceServersFor(uid) {
   const stun = { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] };
   if (process.env.ICE_SERVERS) {
     try { return JSON.parse(process.env.ICE_SERVERS); } catch { /* ignora */ }
+  }
+  // Cloudflare (grátis até 1000 GB/mês, servidores no Brasil = menos atraso): CF_TURN_KEY_ID e CF_TURN_TOKEN
+  if (process.env.CF_TURN_KEY_ID && process.env.CF_TURN_TOKEN) {
+    if (cfCache.list && Date.now() - cfCache.at < 6 * 3600e3) return cfCache.list;
+    try {
+      const r = await fetch(`https://rtc.live.cloudflare.com/v1/turn/keys/${encodeURIComponent(process.env.CF_TURN_KEY_ID)}/credentials/generate-ice-servers`, {
+        method: 'POST', headers: { Authorization: `Bearer ${process.env.CF_TURN_TOKEN}`, 'content-type': 'application/json' }, body: JSON.stringify({ ttl: 86400 }) });
+      const d = await r.json();
+      const list = Array.isArray(d.iceServers) ? d.iceServers : d.iceServers ? [d.iceServers] : [];
+      if (list.length) { cfCache = { at: Date.now(), list: [stun, ...list] }; return cfCache.list; }
+      console.warn('Cloudflare TURN sem servidores:', JSON.stringify(d).slice(0, 200));
+    } catch (e) { console.warn('Cloudflare TURN falhou:', e.message); }
   }
   // Metered (grátis com cadastro): METERED_DOMAIN=seuapp.metered.live e METERED_API_KEY
   if (process.env.METERED_DOMAIN && process.env.METERED_API_KEY) {
@@ -1551,7 +2222,7 @@ function leaveVoice(sock) {
 io.use((sock, next) => {
   const ses = sessionFromCookie(sock.handshake.headers.cookie);
   const u = ses && userById(ses.user_id);
-  if (!u || u.banned) return next(new Error('unauthorized'));
+  if (!u || u.banned || isSuspended(u) || u.status === 'pending') return next(new Error('unauthorized'));
   sock.data.user = u;
   sock.data.token = ses.token;
   next();
