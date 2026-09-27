@@ -27,6 +27,12 @@ const ICONS = {
   expand: '<path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/>',
   shrink: '<path d="M4 14h6v6M20 10h-6V4M14 10l7-7M3 21l7-7"/>',
   x: '<path d="M18 6 6 18M6 6l12 12"/>',
+  shield: '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>',
+  folder: '<path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>',
+  sparkle: '<path d="M12 3l1.9 5.8L20 11l-6.1 2.2L12 19l-1.9-5.8L4 11l6.1-2.2z"/>',
+  lock: '<rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>',
+  megaphone: '<path d="m3 11 18-8v18L3 13z"/><path d="M11.6 16.8a3 3 0 1 1-5.8-1.6"/>',
+  caret: '<path d="m9 18 6-6-6-6"/>',
   trash: '<path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6"/>',
   send: '<path d="m22 2-7 20-4-9-9-4z"/><path d="M22 2 11 13"/>',
   users: '<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.9M16 3.1a4 4 0 0 1 0 7.8"/>',
@@ -135,6 +141,9 @@ const S = {
   messages: {},      // cid -> []
   hasMore: {},       // cid -> bool
   voice: {},         // cid -> participantes
+  roles: {},         // sid -> cargos
+  ssRefresh: null,
+  collapsed: (() => { try { return new Set(JSON.parse(localStorage.getItem('gp_collapsed') || '[]')); } catch { return new Set(); } })(),
   navOpen: false,
   iceServers: null,
 };
@@ -209,7 +218,7 @@ async function logout() {
   if (call) leaveCall();
   await api('/api/auth/logout', { method: 'POST' }).catch(() => {});
   socket?.disconnect(); socket = null;
-  Object.assign(S, { me: null, servers: [], serverId: null, channelId: null, channels: {}, messages: {}, voice: {} });
+  Object.assign(S, { me: null, servers: [], serverId: null, channelId: null, channels: {}, messages: {}, voice: {}, roles: {} });
   history.replaceState({}, '', '/');
   renderAuth('login');
 }
@@ -231,26 +240,7 @@ function connectSocket() {
     if (S.messages[channel_id]) S.messages[channel_id] = S.messages[channel_id].filter((m) => m.id !== id);
     if (channel_id === S.channelId) renderMessages(true);
   });
-  socket.on('channel:created', (c) => {
-    const l = S.channels[c.server_id]; if (l && !l.some((x) => x.id === c.id)) l.push(c);
-    if (c.server_id === S.serverId) renderSidebar();
-  });
-  socket.on('channel:updated', (c) => {
-    const l = S.channels[c.server_id]; if (!l) return;
-    const i = l.findIndex((x) => x.id === c.id); if (i >= 0) l[i] = c;
-    if (c.server_id === S.serverId) { renderSidebar(); if (c.id === S.channelId) renderHead(); }
-  });
-  socket.on('channel:deleted', ({ id, server_id }) => {
-    if (S.channels[server_id]) S.channels[server_id] = S.channels[server_id].filter((x) => x.id !== id);
-    delete S.voice[id];
-    if (server_id === S.serverId) {
-      if (S.channelId === id) navigate(`/s/${server_id}`, true); else renderSidebar();
-    }
-  });
-  socket.on('server:updated', (s) => {
-    const i = S.servers.findIndex((x) => x.id === s.id);
-    if (i >= 0) { S.servers[i] = { ...S.servers[i], ...s }; renderRail(); if (s.id === S.serverId) renderSidebar(); }
-  });
+  socket.on('server:refresh', ({ server_id }) => scheduleRefresh(server_id));
   const dropServer = ({ id }) => {
     S.servers = S.servers.filter((s) => s.id !== id);
     if (call && call.serverId === id) leaveCall();
@@ -275,6 +265,35 @@ function connectSocket() {
   });
   socket.on('rtc:signal', onSignal);
   socket.on('rtc:peer-left', ({ socket_id }) => closePeer(socket_id));
+}
+
+// recarrega servidor, canais e cargos quando algo muda (cargos, canais, permissões)
+const refreshTimers = {};
+function scheduleRefresh(sid) {
+  clearTimeout(refreshTimers[sid]);
+  refreshTimers[sid] = setTimeout(() => refreshServer(sid), 120);
+}
+async function refreshServer(sid) {
+  if (!S.servers.some((x) => x.id === sid)) return;
+  try {
+    const [srv, chs, rl] = await Promise.all([api(`/api/servers/${sid}`), api(`/api/servers/${sid}/channels`), api(`/api/servers/${sid}/roles`)]);
+    const i = S.servers.findIndex((x) => x.id === sid); if (i < 0) return;
+    S.servers[i] = srv; S.channels[sid] = chs; S.roles[sid] = rl;
+    Object.keys(S.messages).forEach((cid) => { if (cid !== S.channelId && !chs.some((c) => c.id === cid)) delete S.messages[cid]; });
+    if (call && call.serverId === sid && !chs.some((c) => c.id === call.channelId)) leaveCall();
+    renderRail();
+    if (sid !== S.serverId) return;
+    if (S.channelId && !chs.some((c) => c.id === S.channelId)) return navigate(`/s/${sid}`, true);
+    renderSidebar();
+    const c = chan();
+    if (c?.kind === 'text') {
+      const box = $('#messages');
+      const canNow = !!$('#composer'); 
+      if (canNow !== !!c.can_post || !box) renderMain(); else renderHead();
+    } else if (c?.kind === 'voice' && !(call && call.channelId === c.id)) renderMain();
+    else renderHead();
+    S.ssRefresh?.();
+  } catch { /* tenta de novo no próximo evento */ }
 }
 
 function refreshVoice(sid) {
@@ -345,26 +364,36 @@ function renderSidebar() {
       : '<p class="hint" style="padding:8px">Você ainda não está em nenhum servidor.</p>'}</div>`;
   } else {
     const chs = S.channels[s.id] || [];
-    const text = chs.filter((c) => c.kind === 'text');
-    const voice = chs.filter((c) => c.kind === 'voice');
-    const owner = s.is_owner;
+    const p = s.perms || {};
+    const cats = s.categories || [];
+    const known = new Set(cats.map((c) => c.id));
+    const loose = chs.filter((c) => !known.has(c.category_id));
     const chRow = (c) => `
       <button class="channel ${c.id === S.channelId ? 'active' : ''}" data-ch="${c.id}">
-        ${icon(c.kind === 'voice' ? 'volume' : 'hash')}<span class="n">${esc(c.name)}</span>
-        ${owner ? `<span class="ch-actions"><span class="icon-btn" data-edit-ch="${c.id}" title="Editar canal">${icon('settings')}</span></span>` : ''}
+        ${icon(c.kind === 'voice' ? 'volume' : c.read_only ? 'megaphone' : 'hash')}<span class="n">${esc(c.name)}</span>
+        ${c.allowed_roles?.length ? `<span class="ch-lock" title="Canal privado">${icon('lock')}</span>` : ''}
+        ${p.manage_channels ? `<span class="ch-actions"><span class="icon-btn" data-edit-ch="${c.id}" title="Editar canal">${icon('settings')}</span></span>` : ''}
       </button>
-      ${c.kind === 'voice' ? `<div class="voice-users">${(S.voice[c.id] || []).map((p) => `
-        <div class="voice-user" data-sock="${p.socket_id}">${avatarHtml(p, 'sm')}<span>${esc(p.display_name)}</span>
-          <span class="flags">${p.screen ? '<span class="tag">AO VIVO</span>' : ''}${p.camera ? icon('video') : ''}${p.muted ? icon('micOff') : ''}${p.deafened ? icon('headOff') : ''}</span></div>`).join('')}</div>` : ''}`;
+      ${c.kind === 'voice' ? `<div class="voice-users">${(S.voice[c.id] || []).map((vp) => `
+        <div class="voice-user" data-sock="${vp.socket_id}">${avatarHtml(vp, 'sm')}<span>${esc(vp.display_name)}</span>
+          <span class="flags">${vp.screen ? '<span class="tag">AO VIVO</span>' : ''}${vp.camera ? icon('video') : ''}${vp.muted ? icon('micOff') : ''}${vp.deafened ? icon('headOff') : ''}</span></div>`).join('')}</div>` : ''}`;
+    const catBlock = (cat) => {
+      const list = chs.filter((c) => c.category_id === cat.id);
+      if (!list.length && !p.manage_channels) return '';
+      const closed = S.collapsed.has(cat.id);
+      const shown = closed ? list.filter((c) => c.id === S.channelId || (c.kind === 'voice' && (S.voice[c.id] || []).length)) : list;
+      return `<div class="cat ${closed ? 'closed' : ''}"><button class="cat-name" data-toggle-cat="${cat.id}">${icon('caret', 'caret')}<span>${esc(cat.name)}</span></button>
+        ${p.manage_channels ? `<span class="cat-actions"><button class="icon-btn" data-edit-cat="${cat.id}" title="Editar categoria">${icon('settings')}</button><button class="icon-btn" data-new-in="${cat.id}" title="Criar canal">${icon('plus')}</button></span>` : ''}</div>
+        ${shown.map(chRow).join('')}`;
+    };
     body = `
       <div class="sidebar-head">
         <button class="server-name-btn" id="server-menu-btn">${serverIconHtml(s, 'mini-icon')}<span class="n">${esc(s.name)}</span>${icon('chevron')}</button>
       </div>
       <div class="channels">
-        <div class="cat"><span>Canais de texto</span>${owner ? `<button class="icon-btn" data-new="text" title="Criar canal">${icon('plus')}</button>` : ''}</div>
-        ${text.map(chRow).join('')}
-        <div class="cat"><span>Canais de voz</span>${owner ? `<button class="icon-btn" data-new="voice" title="Criar canal">${icon('plus')}</button>` : ''}</div>
-        ${voice.map(chRow).join('')}
+        ${loose.map(chRow).join('')}
+        ${cats.map(catBlock).join('')}
+        ${!chs.length && !cats.length ? '<p class="hint" style="padding:8px">Nenhum canal ainda.</p>' : ''}
       </div>`;
   }
   const inCall = call ? (Object.values(S.channels).flat().find((c) => c.id === call.channelId)) : null;
@@ -393,7 +422,16 @@ function renderSidebar() {
       navigate(`/s/${S.serverId}/${b.dataset.ch}`);
     };
   });
-  $$('[data-new]', el).forEach((b) => { b.onclick = () => createChannelDialog(b.dataset.new); });
+  $$('[data-new-in]', el).forEach((b) => { b.onclick = () => createChannelDialog('text', b.dataset.newIn); });
+  $$('[data-edit-cat]', el).forEach((b) => { b.onclick = () => categoryDialog(b.dataset.editCat); });
+  $$('[data-toggle-cat]', el).forEach((b) => {
+    b.onclick = () => {
+      const k = b.dataset.toggleCat;
+      if (S.collapsed.has(k)) S.collapsed.delete(k); else S.collapsed.add(k);
+      try { localStorage.setItem('gp_collapsed', JSON.stringify([...S.collapsed])); } catch { /* ignora */ }
+      renderSidebar();
+    };
+  });
   $('#server-menu-btn')?.addEventListener('click', (e) => serverMenu(e.currentTarget));
   $('#me-btn').onclick = () => userSettings('profile');
   $('#ub-settings').onclick = () => userSettings('profile');
@@ -408,7 +446,7 @@ function renderHead() {
   const h = $('.main-head'); if (!h) return;
   const c = chan();
   h.innerHTML = `<button class="icon-btn menu-toggle" id="menu-toggle">${icon('menu')}</button>
-    ${c ? `${icon(c.kind === 'voice' ? 'volume' : 'hash', 'muted')}<span>${esc(c.name)}</span>` : `<span>${esc(current()?.name || 'Início')}</span>`}
+    ${c ? `${icon(c.kind === 'voice' ? 'volume' : c.read_only ? 'megaphone' : 'hash', 'muted')}<span>${esc(c.name)}</span>${c.topic ? `<span class="topic">${esc(c.topic)}</span>` : ''}` : `<span>${esc(current()?.name || 'Início')}</span>`}
     <span class="spacer"></span>
     ${current() ? `<button class="icon-btn" id="head-invite" title="Convidar pessoas">${icon('userPlus')}</button>
     <button class="icon-btn" id="head-members" title="Membros">${icon('users')}</button>` : ''}`;
@@ -435,7 +473,7 @@ function renderMain() {
     return;
   }
   if (!c) {
-    el.innerHTML = `<div class="main-head"></div><div class="empty"><div><div class="ico">${icon('hash')}</div><h2>Nenhum canal</h2><p>${s.is_owner ? 'Crie um canal para começar.' : 'Este servidor ainda não tem canais.'}</p></div></div>`;
+    el.innerHTML = `<div class="main-head"></div><div class="empty"><div><div class="ico">${icon('hash')}</div><h2>Nenhum canal</h2><p>${s.perms?.manage_channels ? 'Crie um canal para começar.' : 'Este servidor ainda não tem canais que você possa ver.'}</p></div></div>`;
     renderHead();
     return;
   }
@@ -447,8 +485,11 @@ function renderMain() {
 async function openServer(sid, cid) {
   const changed = S.serverId !== sid;
   S.serverId = sid;
-  if (!S.channels[sid]) {
-    try { S.channels[sid] = await api(`/api/servers/${sid}/channels`); } catch (e) { toast(e.message, true); return navigate('/', true); }
+  if (!S.channels[sid] || !S.roles[sid]) {
+    try {
+      const [chs, rl] = await Promise.all([api(`/api/servers/${sid}/channels`), api(`/api/servers/${sid}/roles`)]);
+      S.channels[sid] = chs; S.roles[sid] = rl;
+    } catch (e) { toast(e.message, true); return navigate('/', true); }
   }
   if (changed) refreshVoice(sid);
   const chs = S.channels[sid];
@@ -465,10 +506,13 @@ async function openServer(sid, cid) {
 function renderTextChannel(el, c) {
   el.innerHTML = `<div class="main-head"></div>
     <div class="messages" id="messages"></div>
-    <form class="composer" id="composer"><div class="composer-box">
+    ${c.can_post ? `<form class="composer" id="composer"><div class="composer-box">
       <textarea id="msg-input" rows="1" maxlength="2000" placeholder="Conversar em #${esc(c.name)}"></textarea>
-      <button class="send" type="submit" disabled title="Enviar">${icon('send')}</button></div></form>`;
+      <button class="send" type="submit" disabled title="Enviar">${icon('send')}</button></div></form>`
+    : `<div class="composer"><div class="composer-box readonly">${icon('lock')}Você não tem permissão para enviar mensagens neste canal.</div></div>`}`;
   renderHead();
+  loadMessages(c);
+  if (!c.can_post) return;
   const ta = $('#msg-input');
   const sendBtn = $('#composer .send');
   const grow = () => { ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 180) + 'px'; sendBtn.disabled = !ta.value.trim(); };
@@ -485,6 +529,8 @@ function renderTextChannel(el, c) {
     } catch (err) { toast(err.message, true); ta.value = content; grow(); }
   };
   if (window.innerWidth > 800) ta.focus();
+}
+function loadMessages(c) {
   if (S.messages[c.id]) renderMessages(true);
   else {
     $('#messages').innerHTML = '<div class="boot" style="height:100%"><div class="spinner"></div></div>';
@@ -498,11 +544,11 @@ function renderTextChannel(el, c) {
 function messageHtml(m, prev) {
   const head = !prev || prev.author_id !== m.author_id || new Date(m.created_at) - new Date(prev.created_at) > 7 * 60e3 || fmtDay(prev.created_at) !== fmtDay(m.created_at);
   const day = !prev || fmtDay(prev.created_at) !== fmtDay(m.created_at) ? `<div class="day-sep">${fmtDay(m.created_at)}</div>` : '';
-  const canDel = m.author_id === S.me.id || current()?.is_owner;
+  const canDel = m.author_id === S.me.id || current()?.perms?.manage_messages;
   const user = { display_name: m.author_name, avatar_url: m.author_avatar };
   return `${day}<div class="msg ${head ? 'head' : ''}" data-mid="${m.id}">
     <div class="gutter">${head ? avatarHtml(user) : `<time>${fmtTime(m.created_at)}</time>`}</div>
-    <div class="body">${head ? `<div class="meta"><b>${esc(m.author_name)}</b><time>${fmtDay(m.created_at)} às ${fmtTime(m.created_at)}</time></div>` : ''}
+    <div class="body">${head ? `<div class="meta"><b style="color:${safeColor(m.author_color) || 'inherit'}">${esc(m.author_name)}</b><time>${fmtDay(m.created_at)} às ${fmtTime(m.created_at)}</time></div>` : ''}
       <div class="text">${linkify(m.content)}</div></div>
     ${canDel ? `<div class="actions"><button class="icon-btn" data-del="${m.id}" title="Excluir mensagem">${icon('trash')}</button></div>` : ''}
   </div>`;
@@ -616,6 +662,12 @@ async function joinCall(cid) {
   if (audioTrack) watchSpeaking('local', new MediaStream([audioTrack]));
   socket.emit('voice:join', cid, (res) => {
     if (!res || res.error) { toast(res?.error || 'Não foi possível entrar.', true); return leaveCall(true); }
+    if (res.listen_only) {
+      call.listenOnly = true; call.muted = true;
+      if (call.audioTrack) call.audioTrack.enabled = false;
+      toast('Neste canal só a Staff fala — você entrou para ouvir e assistir.');
+      renderControls(); renderSidebar();
+    }
     socket.emit('voice:update', { muted: call.muted });
     res.peers.forEach((p) => createPeer(p.socket_id, true));
   });
@@ -726,8 +778,12 @@ function closePeerOf(c, id) {
 }
 function closePeer(id) { if (call) { closePeerOf(call, id); call.gridKey = null; updateCallGrid(); } }
 
+function listenOnlyBlock() {
+  if (call?.listenOnly) { toast('Neste canal só a Staff pode falar, ligar câmera ou transmitir.'); return true; }
+  return false;
+}
 function toggleMute() {
-  if (!call) return;
+  if (!call || listenOnlyBlock()) return;
   if (!call.audioTrack) {
     return navigator.mediaDevices.getUserMedia({ audio: audioConstraints() }).then((st) => {
       if (!call) return;
@@ -751,12 +807,12 @@ function toggleDeafen() {
   call.deafened = !call.deafened;
   applyDeafen();
   if (call.deafened && call.audioTrack) { call.muted = true; call.audioTrack.enabled = false; }
-  if (!call.deafened && call.audioTrack) { call.muted = false; call.audioTrack.enabled = true; }
+  if (!call.deafened && call.audioTrack && !call.listenOnly) { call.muted = false; call.audioTrack.enabled = true; }
   socket.emit('voice:update', { muted: call.muted, deafened: call.deafened });
   renderControls(); renderSidebar();
 }
 async function toggleCamera() {
-  if (!call) return;
+  if (!call || listenOnlyBlock()) return;
   if (call.camTrack) {
     call.camTrack.stop(); call.camTrack = null;
   } else {
@@ -773,7 +829,7 @@ async function toggleCamera() {
   renderControls(); updateCallGrid();
 }
 async function toggleScreen() {
-  if (!call) return;
+  if (!call || listenOnlyBlock()) return;
   if (call.screenTrack) {
     call.screenTrack.stop(); call.screenTrack = null;
     call.screenAudioTrack?.stop(); call.screenAudioTrack = null;
@@ -916,13 +972,16 @@ function colorGrid(selected) {
 }
 
 function createServerDialog() {
-  const st = { name: `Servidor de ${S.me.display_name}`, color: colorFor(S.me.display_name + Date.now()), icon_url: '' };
+  const st = { name: `Servidor de ${S.me.display_name}`, color: colorFor(S.me.display_name + Date.now()), icon_url: '', template: 'streamer' };
   const m = openModal(`
     <h2>Crie seu servidor</h2><p class="sub">Um lugar para você e seus amigos conversarem, jogarem e fazerem chamadas.</p>
     <form id="cs-form">
       <div class="upload-row"><div id="cs-prev"></div><div><button type="button" class="btn" id="cs-up">Enviar ícone</button><div class="hint" style="margin-top:6px">Opcional. PNG ou JPG.</div></div></div>
       <div class="field"><label>Nome do servidor</label><input class="input" name="name" maxlength="40" value="${esc(st.name)}"></div>
       <div class="field"><label>Cor</label>${colorGrid(st.color)}</div>
+      <div class="field"><label>Começar com</label>
+        <button type="button" class="kind-opt" data-t="streamer">${icon('sparkle')}<span><b>Modelo streamer</b><small>Cargos, regras, canais de clipes, jogos, voz e área da Staff prontos</small></span></button>
+        <button type="button" class="kind-opt" data-t="blank">${icon('hash')}<span><b>Em branco</b><small>Só #geral e uma sala de voz</small></span></button></div>
       <div class="error-text" id="cs-err"></div>
       <div class="foot"><button type="button" class="btn ghost" id="cs-cancel">Cancelar</button><button class="btn primary">Criar servidor</button></div>
     </form>`);
@@ -931,12 +990,15 @@ function createServerDialog() {
   $('[name=name]', m).oninput = (e) => { st.name = e.target.value; prev(); };
   $$('[data-color]', m).forEach((b) => { b.onclick = () => { st.color = b.dataset.color; $$('[data-color]', m).forEach((x) => x.classList.toggle('sel', x === b)); prev(); }; });
   $('#cs-up', m).onclick = async () => { const u = await pickImage(); if (u) { st.icon_url = u; prev(); } };
+  const tsel = () => $$('[data-t]', m).forEach((b) => b.classList.toggle('sel', b.dataset.t === st.template));
+  tsel();
+  $$('[data-t]', m).forEach((b) => { b.onclick = () => { st.template = b.dataset.t; tsel(); }; });
   $('#cs-cancel', m).onclick = closeModal;
   $('#cs-form', m).onsubmit = async (e) => {
     e.preventDefault();
     const btn = e.submitter; btn.disabled = true;
     try {
-      const s = await api('/api/servers', { method: 'POST', body: { name: st.name, color: st.color, icon_url: st.icon_url } });
+      const s = await api('/api/servers', { method: 'POST', body: { name: st.name, color: st.color, icon_url: st.icon_url, template: st.template } });
       S.servers.push(s);
       closeModal();
       navigate(`/s/${s.id}`);
@@ -1014,26 +1076,57 @@ async function copyText(t) {
   catch { const i = $('#inv-link') || document.createElement('input'); i.value = t; i.select(); document.execCommand('copy'); toast('Link copiado!'); }
 }
 
-function createChannelDialog(kind = 'text') {
+const PERM_LABELS = {
+  admin: ['Administrador', 'Pode tudo. Dê só para quem você confia muito.'],
+  manage_server: ['Gerenciar servidor', 'Mudar nome, ícone, convites e cargo automático.'],
+  manage_channels: ['Gerenciar canais', 'Criar, editar, organizar e excluir canais e categorias.'],
+  manage_roles: ['Gerenciar cargos', 'Criar cargos e dar/tirar cargos dos membros.'],
+  manage_messages: ['Gerenciar mensagens', 'Apagar mensagens de outros e falar em canais só leitura.'],
+  kick: ['Expulsar membros', 'Remover pessoas do servidor.'],
+};
+const perms = () => current()?.perms || {};
+const roles = () => S.roles[S.serverId] || [];
+const safeColor = (c) => (/^#[0-9a-f]{6}$/i.test(c || '') ? c : '');
+
+function categoryOptions(selected) {
+  const s = current();
+  return `<option value="">Sem categoria</option>` + (s.categories || []).map((c) => `<option value="${c.id}" ${c.id === selected ? 'selected' : ''}>${esc(c.name)}</option>`).join('');
+}
+function roleChecks(selected = [], name = 'role') {
+  if (!roles().length) return '<p class="hint">Crie cargos em Configurações do servidor → Cargos.</p>';
+  return `<div class="role-checks">${roles().map((r) => `
+    <label class="role-check"><input type="checkbox" name="${name}" value="${r.id}" ${selected.includes(r.id) ? 'checked' : ''}>
+      <span class="role-dot" style="background:${safeColor(r.color) || '#99aab5'}"></span>${esc(r.name)}</label>`).join('')}</div>`;
+}
+
+function createChannelDialog(kind = 'text', categoryId) {
   let k = kind;
+  const s = current();
+  if (categoryId === undefined) categoryId = (s.categories || []).find((c) => /voz|voice/i.test(c.name) === (kind === 'voice'))?.id || '';
   const m = openModal(`
-    <h2>Criar canal</h2><p class="sub">em ${esc(current().name)}</p>
+    <h2>Criar canal</h2><p class="sub">em ${esc(s.name)}</p>
     <form id="cc">
       <div class="field"><label>Tipo de canal</label>
         <button type="button" class="kind-opt" data-k="text">${icon('hash')}<span><b>Texto</b><small>Mensagens, links e conversas</small></span></button>
         <button type="button" class="kind-opt" data-k="voice">${icon('volume')}<span><b>Voz</b><small>Voz, vídeo e compartilhamento de tela</small></span></button></div>
       <div class="field"><label>Nome do canal</label><input class="input" name="name" maxlength="40" placeholder="novo-canal"></div>
-      <div class="error-text" id="cc-err"></div>
+      <div class="field"><label>Categoria</label><select class="input" name="category_id">${categoryOptions(categoryId)}</select></div>
+      <div class="switch"><span>Canal privado <small class="hint" style="display:block">Só os cargos escolhidos veem o canal.</small></span><input type="checkbox" name="private"></div>
+      <div id="cc-roles" class="hidden" style="padding-top:10px">${roleChecks()}</div>
+      <div class="error-text" id="cc-err" style="margin-top:12px"></div>
       <div class="foot"><button type="button" class="btn ghost" id="cc-cancel">Cancelar</button><button class="btn primary">Criar canal</button></div>
     </form>`);
   const sel = () => $$('[data-k]', m).forEach((b) => b.classList.toggle('sel', b.dataset.k === k));
   sel();
   $$('[data-k]', m).forEach((b) => { b.onclick = () => { k = b.dataset.k; sel(); }; });
+  $('[name=private]', m).onchange = (e) => $('#cc-roles', m).classList.toggle('hidden', !e.target.checked);
   $('#cc-cancel', m).onclick = closeModal;
   $('#cc', m).onsubmit = async (e) => {
     e.preventDefault(); const btn = e.submitter; btn.disabled = true;
+    const f = e.target;
+    const allowed = f.private.checked ? $$('[name=role]:checked', m).map((x) => x.value) : [];
     try {
-      const c = await api(`/api/servers/${S.serverId}/channels`, { method: 'POST', body: { name: e.target.name.value, kind: k } });
+      const c = await api(`/api/servers/${S.serverId}/channels`, { method: 'POST', body: { name: f.name.value, kind: k, category_id: f.category_id.value, allowed_roles: allowed } });
       const l = S.channels[S.serverId]; if (!l.some((x) => x.id === c.id)) l.push(c);
       closeModal();
       navigate(`/s/${S.serverId}/${c.id}`);
@@ -1043,48 +1136,96 @@ function createChannelDialog(kind = 'text') {
 
 function channelSettingsDialog(cid) {
   const c = (S.channels[S.serverId] || []).find((x) => x.id === cid); if (!c) return;
+  const priv = !!c.allowed_roles?.length;
   const m = openModal(`
     <h2>Editar canal</h2><p class="sub">${c.kind === 'voice' ? 'Canal de voz' : 'Canal de texto'}</p>
-    <form id="ec"><div class="field"><label>Nome</label><input class="input" name="name" maxlength="40" value="${esc(c.name)}"></div>
-    <div class="error-text" id="ec-err"></div>
-    <div class="foot" style="justify-content:space-between"><button type="button" class="btn danger" id="ec-del">${icon('trash')}Excluir</button>
-    <span style="display:flex;gap:8px"><button type="button" class="btn ghost" id="ec-cancel">Cancelar</button><button class="btn primary">Salvar</button></span></div></form>`);
+    <form id="ec">
+      <div class="field"><label>Nome</label><input class="input" name="name" maxlength="40" value="${esc(c.name)}"></div>
+      ${c.kind === 'text' ? `<div class="field"><label>Tópico</label><input class="input" name="topic" maxlength="200" value="${esc(c.topic || '')}" placeholder="Sobre o que é este canal?"></div>` : ''}
+      <div class="field"><label>Categoria</label><select class="input" name="category_id">${categoryOptions(c.category_id)}</select></div>
+      <div class="switch"><span>${c.kind === 'voice' ? 'Só a Staff fala' : 'Só leitura'} <small class="hint" style="display:block">${c.kind === 'voice' ? 'Os outros entram só para ouvir e assistir.' : 'Só quem pode gerenciar mensagens escreve aqui.'}</small></span><input type="checkbox" name="read_only" ${c.read_only ? 'checked' : ''}></div>
+      <div class="switch"><span>Canal privado <small class="hint" style="display:block">Só os cargos escolhidos veem o canal.</small></span><input type="checkbox" name="private" ${priv ? 'checked' : ''}></div>
+      <div id="ec-roles" class="${priv ? '' : 'hidden'}" style="padding-top:10px">${roleChecks(c.allowed_roles || [])}</div>
+      <div style="display:flex;gap:8px;margin-top:14px"><button type="button" class="btn ghost" data-move="-1">↑ Subir</button><button type="button" class="btn ghost" data-move="1">↓ Descer</button></div>
+      <div class="error-text" id="ec-err" style="margin-top:10px"></div>
+      <div class="foot" style="justify-content:space-between"><button type="button" class="btn danger" id="ec-del">${icon('trash')}Excluir</button>
+      <span style="display:flex;gap:8px"><button type="button" class="btn ghost" id="ec-cancel">Cancelar</button><button class="btn primary">Salvar</button></span></div>
+    </form>`);
+  $('[name=private]', m).onchange = (e) => $('#ec-roles', m).classList.toggle('hidden', !e.target.checked);
   $('#ec-cancel', m).onclick = closeModal;
+  $$('[data-move]', m).forEach((b) => { b.onclick = () => api(`/api/channels/${c.id}`, { method: 'PATCH', body: { move: Number(b.dataset.move) } }).catch((err) => toast(err.message, true)); });
   $('#ec-del', m).onclick = async () => {
     if (!confirm(`Excluir o canal "${c.name}"? As mensagens serão apagadas.`)) return;
     try { await api(`/api/channels/${c.id}`, { method: 'DELETE' }); closeModal(); } catch (err) { $('#ec-err', m).textContent = err.message; }
   };
   $('#ec', m).onsubmit = async (e) => {
     e.preventDefault();
-    try { await api(`/api/channels/${c.id}`, { method: 'PATCH', body: { name: e.target.name.value } }); closeModal(); } catch (err) { $('#ec-err', m).textContent = err.message; }
+    const f = e.target;
+    const body = { name: f.name.value, category_id: f.category_id.value, read_only: f.read_only.checked,
+      allowed_roles: f.private.checked ? $$('[name=role]:checked', m).map((x) => x.value) : [] };
+    if (f.topic) body.topic = f.topic.value;
+    if (f.private.checked && !body.allowed_roles.length) { $('#ec-err', m).textContent = 'Escolha pelo menos um cargo para o canal privado.'; return; }
+    try { await api(`/api/channels/${c.id}`, { method: 'PATCH', body }); closeModal(); toast('Canal salvo.'); } catch (err) { $('#ec-err', m).textContent = err.message; }
+  };
+}
+
+function categoryDialog(catId) {
+  const s = current();
+  const cat = (s.categories || []).find((c) => c.id === catId);
+  const m = openModal(`
+    <h2>${cat ? 'Editar categoria' : 'Criar categoria'}</h2><p class="sub">Categorias agrupam canais na barra lateral.</p>
+    <form id="cf"><div class="field"><label>Nome</label><input class="input" name="name" maxlength="40" value="${esc(cat?.name || '')}" placeholder="ex.: 🎮 Jogos"></div>
+    ${cat ? `<div style="display:flex;gap:8px"><button type="button" class="btn ghost" data-move="-1">↑ Subir</button><button type="button" class="btn ghost" data-move="1">↓ Descer</button></div>` : ''}
+    <div class="error-text" id="cf-err" style="margin-top:10px"></div>
+    <div class="foot" style="justify-content:${cat ? 'space-between' : 'flex-end'}">${cat ? `<button type="button" class="btn danger" id="cf-del">${icon('trash')}Excluir</button>` : ''}
+    <span style="display:flex;gap:8px"><button type="button" class="btn ghost" id="cf-cancel">Cancelar</button><button class="btn primary">${cat ? 'Salvar' : 'Criar'}</button></span></div></form>`);
+  $('#cf-cancel', m).onclick = closeModal;
+  $$('[data-move]', m).forEach((b) => { b.onclick = () => api(`/api/servers/${s.id}/categories/${cat.id}`, { method: 'PATCH', body: { move: Number(b.dataset.move) } }).catch((err) => toast(err.message, true)); });
+  $('#cf-del', m)?.addEventListener('click', async () => {
+    if (!confirm(`Excluir a categoria "${cat.name}"? Os canais dela não são apagados, só ficam sem categoria.`)) return;
+    try { await api(`/api/servers/${s.id}/categories/${cat.id}`, { method: 'DELETE' }); closeModal(); } catch (err) { $('#cf-err', m).textContent = err.message; }
+  });
+  $('#cf', m).onsubmit = async (e) => {
+    e.preventDefault();
+    try {
+      if (cat) await api(`/api/servers/${s.id}/categories/${cat.id}`, { method: 'PATCH', body: { name: e.target.name.value } });
+      else await api(`/api/servers/${s.id}/categories`, { method: 'POST', body: { name: e.target.name.value } });
+      closeModal();
+    } catch (err) { $('#cf-err', m).textContent = err.message; }
   };
 }
 
 function serverMenu(anchor) {
   $('.menu')?.remove();
   const s = current();
+  const p = perms();
   const r = anchor.getBoundingClientRect();
   const menu = document.createElement('div');
   menu.className = 'menu';
+  const canSettings = p.manage_server || p.manage_roles || p.kick;
   menu.innerHTML = `
     <button data-a="invite">Convidar pessoas ${icon('userPlus')}</button>
-    ${s.is_owner ? `<button data-a="settings">Configurações do servidor ${icon('settings')}</button>
-    <button data-a="text">Criar canal de texto ${icon('hash')}</button>
-    <button data-a="voice">Criar canal de voz ${icon('volume')}</button>` : ''}
+    ${canSettings ? `<button data-a="settings">Configurações do servidor ${icon('settings')}</button>` : ''}
+    ${p.manage_roles ? `<button data-a="roles">Cargos ${icon('shield')}</button>` : ''}
+    ${p.manage_channels ? `<button data-a="text">Criar canal ${icon('hash')}</button><button data-a="category">Criar categoria ${icon('folder')}</button>` : ''}
+    ${s.is_owner ? `<button data-a="template">Aplicar modelo streamer ${icon('sparkle')}</button>` : ''}
     <button data-a="members">Membros ${icon('users')}</button>
     <hr>
     ${s.is_owner ? `<button data-a="delete" class="red">Excluir servidor ${icon('trash')}</button>` : `<button data-a="leave" class="red">Sair do servidor ${icon('door')}</button>`}`;
   document.body.appendChild(menu);
-  menu.style.left = r.left + 'px'; menu.style.top = r.bottom + 6 + 'px'; menu.style.width = Math.max(220, r.width) + 'px';
+  menu.style.left = r.left + 'px'; menu.style.top = r.bottom + 6 + 'px'; menu.style.width = Math.max(240, r.width) + 'px';
   const off = (e) => { if (!menu.contains(e.target)) { menu.remove(); document.removeEventListener('mousedown', off); } };
   setTimeout(() => document.addEventListener('mousedown', off));
   menu.onclick = async (e) => {
     const a = e.target.closest('[data-a]')?.dataset.a; if (!a) return;
     menu.remove();
     if (a === 'invite') inviteDialog();
-    if (a === 'settings') serverSettings('overview');
+    if (a === 'settings') serverSettings();
+    if (a === 'roles') serverSettings('roles');
     if (a === 'members') serverSettings('members');
-    if (a === 'text' || a === 'voice') createChannelDialog(a);
+    if (a === 'text') createChannelDialog('text');
+    if (a === 'category') categoryDialog();
+    if (a === 'template') serverSettings('template');
     if (a === 'delete') deleteServer();
     if (a === 'leave') {
       if (!confirm(`Sair de "${s.name}"?`)) return;
@@ -1101,37 +1242,53 @@ async function deleteServer() {
 }
 
 // ---------------------------------------------------------------- configurações do servidor
-function serverSettings(tab = 'overview') {
+function serverSettings(tab) {
   const s = current(); if (!s) return;
-  const tabs = s.is_owner ? [['overview', 'Visão geral'], ['members', 'Membros'], ['invites', 'Convites']] : [['members', 'Membros']];
+  const p = perms();
+  const tabs = [
+    p.manage_server && ['overview', 'Visão geral'],
+    p.manage_roles && ['roles', 'Cargos'],
+    ['members', 'Membros'],
+    p.manage_server && ['invites', 'Convites'],
+    s.is_owner && ['template', 'Modelo streamer'],
+  ].filter(Boolean);
   if (!tabs.some((t) => t[0] === tab)) tab = tabs[0][0];
   const m = openModal(`
     <nav class="settings-nav"><h4>${esc(s.name)}</h4>
       ${tabs.map(([k, l]) => `<button data-tab="${k}">${l}</button>`).join('')}
       ${s.is_owner ? '<button class="red" data-tab="delete">Excluir servidor</button>' : ''}
     </nav>
-    <section class="settings-body"><button class="icon-btn close" id="ss-close">${icon('x')}</button><div id="ss-body"></div></section>`, { wide: true });
+    <section class="settings-body"><button class="icon-btn close" id="ss-close">${icon('x')}</button><div id="ss-body"></div></section>`,
+  { wide: true, onClose: () => { S.ssRefresh = null; } });
   $('#ss-close', m).onclick = closeModal;
+  let active = tab;
   const show = (t) => {
     if (t === 'delete') return deleteServer();
+    active = t;
     $$('[data-tab]', m).forEach((b) => b.classList.toggle('active', b.dataset.tab === t));
-    ({ overview: ssOverview, members: ssMembers, invites: ssInvites })[t]($('#ss-body', m));
+    const body = $('#ss-body', m);
+    if (t !== 'roles') body._open = null;
+    ({ overview: ssOverview, roles: (x) => ssRoles(x, x._open), members: ssMembers, invites: ssInvites, template: ssTemplate })[t](body);
   };
+  // quando algo muda no servidor, a aba aberta se atualiza (menos a de edição de texto)
+  S.ssRefresh = () => { if (active === 'roles' || active === 'members') show(active); };
   $$('[data-tab]', m).forEach((b) => { b.onclick = () => show(b.dataset.tab); });
   show(tab);
 }
 function ssOverview(el) {
   const s = current();
-  const st = { name: s.name, color: s.color, icon_url: s.icon_url };
+  const st = { name: s.name, color: s.color, icon_url: s.icon_url, default_role_id: s.default_role_id || '' };
   el.innerHTML = `<h3>Visão geral do servidor</h3>
     <div class="upload-row"><div id="so-prev"></div><div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn" id="so-up">Alterar ícone</button><button class="btn ghost" id="so-rm">Remover</button></div></div>
     <div class="field"><label>Nome do servidor</label><input class="input" id="so-name" maxlength="40" value="${esc(st.name)}"></div>
     <div class="field"><label>Cor</label>${colorGrid(st.color)}</div>
+    <div class="field"><label>Cargo automático para quem entra</label><select class="input" id="so-role"><option value="">Nenhum</option>${roles().filter((r) => !r.perms?.admin).map((r) => `<option value="${r.id}" ${r.id === st.default_role_id ? 'selected' : ''}>${esc(r.name)}</option>`).join('')}</select></div>
     <div class="error-text" id="so-err"></div>
     <button class="btn primary" id="so-save">Salvar alterações</button>`;
   const prev = () => { $('#so-prev', el).innerHTML = serverIconHtml({ ...st, name: st.name || '?' }); };
   prev();
   $('#so-name', el).oninput = (e) => { st.name = e.target.value; prev(); };
+  $('#so-role', el).onchange = (e) => { st.default_role_id = e.target.value; };
   $$('[data-color]', el).forEach((b) => { b.onclick = () => { st.color = b.dataset.color; $$('[data-color]', el).forEach((x) => x.classList.toggle('sel', x === b)); prev(); }; });
   $('#so-up', el).onclick = async () => { const u = await pickImage(); if (u) { st.icon_url = u; prev(); } };
   $('#so-rm', el).onclick = () => { st.icon_url = ''; prev(); };
@@ -1144,21 +1301,111 @@ function ssOverview(el) {
     e.target.disabled = false;
   };
 }
+
+function ssRoles(el, openId) {
+  const list = roles();
+  const isAdmin = perms().admin;
+  el.innerHTML = `<h3>Cargos</h3>
+    <p class="hint" style="margin:-8px 0 14px">O cargo mais alto da lista define a cor do nome. O dono do servidor sempre pode tudo.</p>
+    <button class="btn primary" id="rl-new">${icon('plus')}Criar cargo</button>
+    <div class="role-list">${list.map((r, i) => `
+      <div class="role-row" data-rid="${r.id}">
+        <span class="role-dot" style="background:${safeColor(r.color) || '#99aab5'}"></span>
+        <b style="color:${safeColor(r.color) || 'inherit'}">${esc(r.name)}</b>
+        ${r.perms?.admin ? '<span class="badge">ADMIN</span>' : ''}${r.id === current().default_role_id ? '<span class="badge soft">AUTOMÁTICO</span>' : ''}
+        <span class="spacer"></span>
+        <button class="icon-btn" data-up="${r.id}" title="Subir" ${i === 0 ? 'disabled' : ''}>↑</button>
+        <button class="icon-btn" data-down="${r.id}" title="Descer" ${i === list.length - 1 ? 'disabled' : ''}>↓</button>
+        <button class="btn ghost" data-open="${r.id}">Editar</button>
+      </div>
+      <div class="role-edit ${openId === r.id ? '' : 'hidden'}" data-edit="${r.id}"></div>`).join('') || '<p class="hint" style="margin-top:14px">Nenhum cargo ainda.</p>'}</div>`;
+  $('#rl-new', el).onclick = async () => {
+    try { const r = await api(`/api/servers/${S.serverId}/roles`, { method: 'POST', body: { name: 'novo cargo', color: '#99aab5' } }); S.roles[S.serverId] = [...roles(), r]; ssRoles(el, r.id); } catch (e) { toast(e.message, true); }
+  };
+  $$('[data-up],[data-down]', el).forEach((b) => {
+    b.onclick = () => api(`/api/roles/${b.dataset.up || b.dataset.down}`, { method: 'PATCH', body: { move: b.dataset.up ? -1 : 1 } }).catch((e) => toast(e.message, true));
+  });
+  const fill = (r) => {
+    el._open = r.id;
+    const box = $(`[data-edit="${r.id}"]`, el);
+    box.classList.remove('hidden');
+    box.innerHTML = `
+      <div class="field"><label>Nome do cargo</label><input class="input" data-f="name" maxlength="32" value="${esc(r.name)}"></div>
+      <div class="field"><label>Cor</label><div style="display:flex;gap:10px;align-items:center"><input type="color" data-f="color" value="${safeColor(r.color) || '#99aab5'}" class="color-pick">
+        ${['#ef4444', '#f97316', '#eab308', '#22c55e', '#06b6d4', '#3b82f6', '#a855f7', '#ec4899', '#99aab5'].map((c) => `<button type="button" class="swatch" data-sw="${c}" style="background:${c}"></button>`).join('')}</div></div>
+      <div class="switch"><span>Mostrar separado na lista de membros</span><input type="checkbox" data-f="hoist" ${r.hoist ? 'checked' : ''}></div>
+      <h4 class="perm-title">Permissões</h4>
+      ${Object.entries(PERM_LABELS).map(([k, [t, d]]) => `
+        <div class="switch"><span>${t}<small class="hint" style="display:block">${d}</small></span><input type="checkbox" data-p="${k}" ${r.perms?.[k] ? 'checked' : ''} ${k === 'admin' && !isAdmin ? 'disabled' : ''}></div>`).join('')}
+      <div class="error-text" data-err style="margin-top:10px"></div>
+      <div class="foot" style="justify-content:space-between;margin-top:6px"><button class="btn danger" data-del>${icon('trash')}Excluir cargo</button><button class="btn primary" data-save>Salvar cargo</button></div>`;
+    $$('[data-sw]', box).forEach((b) => { b.onclick = () => { $('[data-f=color]', box).value = b.dataset.sw; }; });
+    $('[data-del]', box).onclick = async () => {
+      if (!confirm(`Excluir o cargo "${r.name}"? Quem tem esse cargo perde ele.`)) return;
+      try { await api(`/api/roles/${r.id}`, { method: 'DELETE' }); } catch (e) { $('[data-err]', box).textContent = e.message; }
+    };
+    $('[data-save]', box).onclick = async (e) => {
+      e.target.disabled = true;
+      const body = { name: $('[data-f=name]', box).value, color: $('[data-f=color]', box).value, hoist: $('[data-f=hoist]', box).checked,
+        perms: Object.fromEntries($$('[data-p]', box).map((x) => [x.dataset.p, x.checked])) };
+      try { await api(`/api/roles/${r.id}`, { method: 'PATCH', body }); toast('Cargo salvo.'); } catch (err) { $('[data-err]', box).textContent = err.message; }
+      e.target.disabled = false;
+    };
+  };
+  $$('[data-open]', el).forEach((b) => {
+    b.onclick = () => {
+      const box = $(`[data-edit="${b.dataset.open}"]`, el);
+      const opening = box.classList.contains('hidden');
+      $$('.role-edit', el).forEach((x) => { x.classList.add('hidden'); x.innerHTML = ''; });
+      el._open = null;
+      if (opening) { box.classList.remove('hidden'); fill(list.find((r) => r.id === b.dataset.open)); }
+    };
+  });
+  if (openId && list.some((r) => r.id === openId)) fill(list.find((r) => r.id === openId));
+}
+
 async function ssMembers(el) {
   const s = current();
+  const p = perms();
   el.innerHTML = `<h3>Membros</h3><div class="spinner"></div>`;
   try {
     const list = await api(`/api/servers/${s.id}/members`);
-    list.sort((a, b) => (b.is_owner - a.is_owner) || (b.online - a.online) || a.display_name.localeCompare(b.display_name));
+    const rl = roles();
+    const rank = (u) => { const i = rl.findIndex((r) => u.role_ids.includes(r.id) && r.hoist); return i < 0 ? 999 : i; };
+    list.sort((a, b) => (b.is_owner - a.is_owner) || (rank(a) - rank(b)) || (b.online - a.online) || a.display_name.localeCompare(b.display_name));
     el.innerHTML = `<h3>Membros — ${list.length}</h3>${list.map((u) => `
       <div class="member-row"><span style="position:relative">${avatarHtml(u)}<span class="dot ${u.online ? 'on' : ''}"></span></span>
-        <div class="nm"><b>${esc(u.display_name)}</b> ${u.is_owner ? '<span class="badge">DONO</span>' : ''}<small>${u.online ? 'Online' : 'Offline'} · entrou em ${new Date(u.joined_at).toLocaleDateString('pt-BR')}</small></div>
-        ${s.is_owner && !u.is_owner ? `<button class="btn danger" data-kick="${u.id}" data-name="${esc(u.display_name)}">Remover</button>` : ''}
+        <div class="nm"><b style="color:${safeColor(u.color) || 'inherit'}">${esc(u.display_name)}</b> ${u.is_owner ? '<span class="badge">DONO</span>' : ''}
+          <div class="chips">${rl.filter((r) => u.role_ids.includes(r.id)).map((r) => `<span class="chip"><span class="role-dot" style="background:${safeColor(r.color) || '#99aab5'}"></span>${esc(r.name)}</span>`).join('')}</div>
+          <small>${u.online ? 'Online' : 'Offline'} · entrou em ${new Date(u.joined_at).toLocaleDateString('pt-BR')}</small></div>
+        ${p.manage_roles && rl.length ? `<button class="btn ghost" data-roles="${u.id}">Cargos</button>` : ''}
+        ${p.kick && !u.is_owner && u.id !== S.me.id ? `<button class="btn danger" data-kick="${u.id}" data-name="${esc(u.display_name)}">Remover</button>` : ''}
       </div>`).join('')}`;
     $$('[data-kick]', el).forEach((b) => {
       b.onclick = async () => {
         if (!confirm(`Remover ${b.dataset.name} do servidor?`)) return;
         try { await api(`/api/servers/${s.id}/members/${b.dataset.kick}`, { method: 'DELETE' }); ssMembers(el); } catch (e) { toast(e.message, true); }
+      };
+    });
+    $$('[data-roles]', el).forEach((b) => {
+      b.onclick = (e) => {
+        e.stopPropagation();
+        $('.menu')?.remove();
+        const u = list.find((x) => x.id === b.dataset.roles);
+        const menu = document.createElement('div');
+        menu.className = 'menu role-menu';
+        menu.innerHTML = `<div class="menu-title">Cargos de ${esc(u.display_name)}</div>${roleChecks(u.role_ids, 'mrole')}<button class="btn primary block" data-apply style="margin-top:8px;color:#fff;justify-content:center">Salvar</button>`;
+        document.body.appendChild(menu);
+        const r = b.getBoundingClientRect();
+        menu.style.left = Math.max(8, Math.min(r.left, innerWidth - 260)) + 'px';
+        menu.style.top = Math.min(r.bottom + 6, innerHeight - menu.offsetHeight - 8) + 'px';
+        const off = (ev) => { if (!menu.contains(ev.target)) { menu.remove(); document.removeEventListener('mousedown', off); } };
+        setTimeout(() => document.addEventListener('mousedown', off));
+        $('[data-apply]', menu).onclick = async () => {
+          const ids = $$('[name=mrole]:checked', menu).map((x) => x.value);
+          try { await api(`/api/servers/${s.id}/members/${u.id}/roles`, { method: 'PUT', body: { role_ids: ids } }); menu.remove(); toast('Cargos atualizados.'); }
+          catch (err) { toast(err.message, true); }
+        };
       };
     });
   } catch (e) { el.innerHTML = `<h3>Membros</h3><p class="error-text">${esc(e.message)}</p>`; }
@@ -1174,6 +1421,29 @@ function ssInvites(el) {
   $('#si-new', el).onclick = async () => {
     if (!confirm('Gerar um novo link? O link atual deixará de funcionar.')) return;
     try { const upd = await api(`/api/servers/${s.id}/invite`, { method: 'POST' }); Object.assign(s, upd); ssInvites(el); toast('Novo link gerado.'); } catch (e) { toast(e.message, true); }
+  };
+}
+const TEMPLATE_PREVIEW = `
+  <div class="tpl">
+    <div><h4>Cargos</h4><p>👑 Dono · 🛡️ Staff · 🎥 Parceiro · ⭐ VIP · 🎮 Inscrito (automático) · 🤖 Bots</p></div>
+    <div><h4>📌 Informações <small>só leitura</small></h4><p>#📜regras (já com as regras) · #📢avisos · #🎬videos-novos · #🔴ao-vivo</p></div>
+    <div><h4>💬 Comunidade</h4><p>#💬geral · #🎮clipes · #😂memes · #📸prints · #💡sugestões</p></div>
+    <div><h4>🎮 Jogos</h4><p>#gta-rp · #free-fire · #procurando-duo</p></div>
+    <div><h4>🔊 Voz</h4><p>🔊 Geral · 🎮 Jogando 1 · 🎮 Jogando 2 · 🎥 Live do jh11 (só a Staff fala) · 💤 AFK</p></div>
+    <div><h4>🛡️ Staff <small>privado</small></h4><p>#staff-chat · 🔊 Reunião Staff</p></div>
+  </div>`;
+function ssTemplate(el) {
+  el.innerHTML = `<h3>Modelo streamer</h3>
+    <p class="hint" style="margin:-8px 0 14px">Cria cargos, categorias e canais prontos. Nada que já existe é apagado — só adiciona o que falta.</p>
+    ${TEMPLATE_PREVIEW}
+    <button class="btn primary" id="tp-apply" style="margin-top:16px">${icon('sparkle')}Aplicar no servidor</button>`;
+  $('#tp-apply', el).onclick = async (e) => {
+    e.target.disabled = true;
+    try {
+      const r = await api(`/api/servers/${S.serverId}/template`, { method: 'POST' });
+      toast(`Pronto! ${r.roles} cargos, ${r.categories} categorias e ${r.channels} canais criados.`);
+      closeModal();
+    } catch (err) { toast(err.message, true); e.target.disabled = false; }
   };
 }
 

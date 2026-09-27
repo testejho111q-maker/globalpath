@@ -301,3 +301,44 @@ svg.i { width: 18px; height: 18px; flex: none; stroke: currentColor; fill: none;
 .call { position: relative; }
 .tile .fs { opacity: .85; }
 .call:fullscreen .tile .label { top: 12px; left: 12px; bottom: auto; }
+
+/* ---------- categorias, cargos e permissões */
+.cat { padding: 14px 4px 4px 2px; }
+.cat .cat-name { display: flex; align-items: center; gap: 4px; flex: 1; min-width: 0; font: inherit; color: inherit; text-transform: inherit; letter-spacing: inherit; text-align: left; }
+.cat .cat-name span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cat .cat-name:hover { color: var(--text-2); }
+.cat .caret { width: 12px; height: 12px; transform: rotate(90deg); transition: transform .15s; }
+.cat.closed .caret { transform: none; }
+.cat .cat-actions { display: flex; opacity: 0; transition: opacity .15s; }
+.cat:hover .cat-actions { opacity: 1; }
+.ch-lock { color: var(--text-3); display: grid; }
+.ch-lock svg { width: 13px; height: 13px; }
+.main-head .topic { color: var(--text-3); font-weight: 400; font-size: 13px; padding-left: 12px; margin-left: 4px; border-left: 1px solid var(--border); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.composer-box.readonly { color: var(--text-3); padding: 14px; gap: 10px; align-items: center; }
+.role-checks { display: flex; flex-direction: column; gap: 4px; max-height: 240px; overflow: auto; }
+.role-check { display: flex; align-items: center; gap: 8px; padding: 7px 8px; border-radius: 8px; cursor: pointer; }
+.role-check:hover { background: var(--bg-hover); }
+.role-check input { accent-color: var(--accent); width: 16px; height: 16px; }
+.role-dot { width: 12px; height: 12px; border-radius: 50%; flex: none; display: inline-block; }
+.role-list { margin-top: 14px; display: flex; flex-direction: column; gap: 4px; }
+.role-row { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 10px; background: var(--bg-input); }
+.role-row .spacer { flex: 1; }
+.role-row .btn { height: 32px; }
+.role-edit { background: #13151a; border: 1px solid var(--border); border-radius: 12px; padding: 16px; margin: 2px 0 8px; }
+.icon-btn:disabled { opacity: .3; cursor: default; }
+.badge.soft { background: rgba(34,197,94,.15); color: #6ee7a0; }
+.badge { margin-left: 4px; }
+.chips { display: flex; flex-wrap: wrap; gap: 4px; margin: 4px 0 2px; }
+.chip { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; background: var(--bg-input); border: 1px solid var(--border); padding: 2px 8px; border-radius: 20px; }
+.chip .role-dot { width: 8px; height: 8px; }
+.role-menu { width: 250px; }
+.menu-title { font-size: 12px; font-weight: 700; color: var(--text-3); text-transform: uppercase; letter-spacing: .05em; padding: 6px 8px; }
+.color-pick { width: 44px; height: 36px; border: 0; background: none; padding: 0; cursor: pointer; }
+.swatch { width: 22px; height: 22px; border-radius: 50%; border: 2px solid rgba(255,255,255,.15); }
+.perm-title { margin: 18px 0 2px; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-3); }
+.tpl { display: grid; gap: 10px; }
+.tpl > div { background: var(--bg-input); border-radius: 10px; padding: 10px 12px; }
+.tpl h4 { margin: 0 0 4px; font-size: 14px; }
+.tpl h4 small { font-weight: 500; color: var(--text-3); margin-left: 6px; font-size: 11px; }
+.tpl p { margin: 0; color: var(--text-2); font-size: 13px; line-height: 1.5; }
+@media (max-width: 800px) { .main-head .topic { display: none; } .cat .cat-actions { opacity: 1; } }
