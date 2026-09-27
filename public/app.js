@@ -1,4 +1,4 @@
-/* GlobalPath — front-end (JavaScript puro, sem build) */
+/* Lumix — front-end (JavaScript puro, sem build) */
 (() => {
 'use strict';
 
@@ -42,6 +42,7 @@ const ICONS = {
   download: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/>',
   paperclip: '<path d="m21.4 11.1-9.2 9.2a6 6 0 0 1-8.5-8.5l9.2-9.2a4 4 0 0 1 5.7 5.7l-9.2 9.2a2 2 0 0 1-2.8-2.8l8.5-8.5"/>',
   image: '<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="m21 15-5-5L5 21"/>',
+  radio: '<circle cx="12" cy="12" r="2"/><path d="M16.2 7.8a6 6 0 0 1 0 8.4M7.8 16.2a6 6 0 0 1 0-8.4M19.1 4.9a10 10 0 0 1 0 14.2M4.9 19.1a10 10 0 0 1 0-14.2"/>',
   chat: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
   compass: '<circle cx="12" cy="12" r="10"/><path d="m16.2 7.8-2.1 6.3-6.3 2.1 2.1-6.3z"/>',
   edit: '<path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/>',
@@ -148,6 +149,7 @@ const S = {
   voice: {},         // cid -> participantes
   roles: {},         // sid -> cargos
   dmId: null,
+  streamer: false,
   dms: [],
   ssRefresh: null,
   collapsed: (() => { try { return new Set(JSON.parse(localStorage.getItem('gp_collapsed') || '[]')); } catch { return new Set(); } })(),
@@ -191,8 +193,9 @@ function renderAuth(mode = 'login') {
   const joining = location.pathname.startsWith('/join/');
   $('#app').innerHTML = `
   <div class="auth">
+    <div class="auth-hero"><img src="/banner.jpg" alt="Lumix — Seu espaço para se conectar."></div>
     <form class="auth-card" id="auth-form" novalidate>
-      <div class="brand"><div class="brand-logo">GP</div><b>GlobalPath</b></div>
+      <div class="brand"><img class="brand-logo" src="/logo-192.png" alt=""><span><b>LUMIX</b><small>Seu espaço para se conectar.</small></span></div>
       <h1>${isLogin ? 'Bem-vindo de volta!' : 'Criar uma conta'}</h1>
       <p class="sub">${joining ? 'Entre para aceitar o convite do servidor.' : isLogin ? 'Que bom te ver de novo.' : 'Leva menos de um minuto.'}</p>
       ${isLogin ? '' : `<div class="field"><label>Nome de exibição</label><input class="input" name="display_name" maxlength="32" autocomplete="nickname" required></div>`}
@@ -349,7 +352,7 @@ function renderRail() {
   const el = $('#rail'); if (!el) return;
   el.innerHTML = `
     <div class="rail-item ${!S.serverId ? 'active' : ''}" data-tip="Conversas"><span class="pill"></span>
-      <button class="rail-add home" data-go="/">${icon('chat')}</button>${totalUnread() ? `<span class="rail-badge">${totalUnread() > 99 ? '99+' : totalUnread()}</span>` : ''}</div>
+      <button class="rail-add home" data-go="/" aria-label="Conversas"><img src="/logo-192.png" alt=""></button>${totalUnread() ? `<span class="rail-badge">${totalUnread() > 99 ? '99+' : totalUnread()}</span>` : ''}</div>
     <div class="sep"></div>
     ${S.servers.map((s) => `
       <div class="rail-item ${s.id === S.serverId ? 'active' : ''}" data-tip="${esc(s.name)}"><span class="pill"></span>
@@ -420,7 +423,7 @@ function renderSidebar() {
   const callServer = call ? S.servers.find((x) => x.id === call.serverId) : null;
   el.innerHTML = body + `
     ${inCall ? `<div class="voice-bar"><div class="status">
-      <div class="info" id="vb-open"><b>Voz conectada</b><small>${esc(inCall.name)} / ${esc(callServer?.name || '')}</small></div>
+      <div class="info" id="vb-open">${S.streamer ? '<span class="streamer-tag">MODO STREAMER</span>' : ''}<b>Voz conectada</b><small>${esc(inCall.name)} / ${esc(callServer?.name || '')}</small></div>
       <button class="icon-btn" id="vb-leave" title="Desconectar">${icon('phoneOff')}</button></div></div>` : ''}
     <div class="user-bar">
       <button class="me" id="me-btn" title="Configurações de perfil">
@@ -429,8 +432,8 @@ function renderSidebar() {
       </button>
       ${call ? `<button class="icon-btn ${call.muted ? 'on' : ''}" id="ub-mute" title="${call.muted ? 'Ativar microfone' : 'Silenciar'}">${icon(call.muted ? 'micOff' : 'mic')}</button>
       <button class="icon-btn ${call.deafened ? 'on' : ''}" id="ub-deaf" title="${call.deafened ? 'Ativar áudio' : 'Desativar áudio'}">${icon(call.deafened ? 'headOff' : 'headphones')}</button>` : ''}
+      <button class="icon-btn ${S.streamer ? 'on' : ''}" id="ub-streamer" title="Modo streamer (${esc(KEYS.streamer || 'sem atalho')})">${icon('radio')}</button>
       <button class="icon-btn" id="ub-settings" title="Configurações">${icon('settings')}</button>
-      <button class="icon-btn" id="ub-logout" title="Sair">${icon('logout')}</button>
     </div>`;
 
   $$('[data-go]', el).forEach((b) => { b.onclick = () => { setNav(false); navigate(b.dataset.go); }; });
@@ -456,9 +459,9 @@ function renderSidebar() {
   $('#dm-new')?.addEventListener('click', newDmDialog);
   $('#me-btn').onclick = () => userSettings('profile');
   $('#ub-settings').onclick = () => userSettings('profile');
-  $('#ub-logout').onclick = () => { if (confirm('Deseja sair da sua conta?')) logout(); };
   $('#ub-mute')?.addEventListener('click', toggleMute);
   $('#ub-deaf')?.addEventListener('click', toggleDeafen);
+  $('#ub-streamer')?.addEventListener('click', toggleStreamer);
   $('#vb-leave')?.addEventListener('click', () => leaveCall());
   $('#vb-open')?.addEventListener('click', () => { setNav(false); navigate(`/s/${call.serverId}/${call.channelId}`); });
 }
@@ -874,11 +877,13 @@ function renderControls() {
   el.innerHTML = `
     <button class="ctrl ${call.muted ? 'off' : ''}" id="c-mic" title="${call.muted ? 'Ativar microfone' : 'Silenciar'}">${icon(call.muted ? 'micOff' : 'mic')}</button>
     <button class="ctrl ${call.deafened ? 'off' : ''}" id="c-deaf" title="${call.deafened ? 'Ativar áudio' : 'Desativar áudio'}">${icon(call.deafened ? 'headOff' : 'headphones')}</button>
+    <button class="ctrl ${S.streamer ? 'streamer' : ''}" id="c-streamer" title="Modo streamer (${esc(KEYS.streamer || 'sem atalho')}): muta e para de ouvir">${icon('radio')}</button>
     <button class="ctrl ${call.camTrack ? 'active' : ''}" id="c-cam" title="${call.camTrack ? 'Desligar câmera' : 'Ligar câmera'}">${icon(call.camTrack ? 'video' : 'videoOff')}</button>
     ${navigator.mediaDevices?.getDisplayMedia ? `<button class="ctrl ${call.screenTrack ? 'active' : ''}" id="c-screen" title="${call.screenTrack ? 'Parar de compartilhar' : 'Compartilhar tela'}">${icon('screen')}</button>` : ''}
     <button class="ctrl leave" id="c-leave" title="Sair da chamada">${icon('phoneOff')}</button>`;
   $('#c-mic').onclick = toggleMute;
   $('#c-deaf').onclick = toggleDeafen;
+  $('#c-streamer').onclick = toggleStreamer;
   $('#c-cam').onclick = toggleCamera;
   $('#c-screen')?.addEventListener('click', toggleScreen);
   $('#c-leave').onclick = () => leaveCall();
@@ -918,7 +923,8 @@ async function joinCall(cid) {
       toast('Neste canal só a Staff fala — você entrou para ouvir e assistir.');
       renderControls(); renderSidebar();
     }
-    socket.emit('voice:update', { muted: call.muted });
+    if (S.streamer) { call.muted = true; call.deafened = true; applyMic(); applyDeafen(); renderControls(); }
+    socket.emit('voice:update', { muted: call.muted, deafened: call.deafened });
     res.peers.forEach((p) => createPeer(p.socket_id, true));
   });
   call.speakTimer = setInterval(checkSpeaking, 150);
@@ -1034,6 +1040,7 @@ function listenOnlyBlock() {
 }
 function toggleMute() {
   if (!call || listenOnlyBlock()) return;
+  S.streamer = false;
   if (!call.audioTrack) {
     return navigator.mediaDevices.getUserMedia({ audio: audioConstraints() }).then((st) => {
       if (!call) return;
@@ -1052,9 +1059,24 @@ function toggleMute() {
   socket.emit('voice:update', { muted: call.muted, deafened: call.deafened });
   renderControls(); renderSidebar();
 }
+// modo streamer: um botão que muta o microfone e para de ouvir a chamada (e desfaz)
+function toggleStreamer() {
+  S.streamer = !S.streamer;
+  if (call) {
+    if (S.streamer) { call.muted = true; call.deafened = true; }
+    else { call.deafened = false; call.muted = !!call.listenOnly || !call.audioTrack; }
+    applyDeafen(); applyMic();
+    socket.emit('voice:update', { muted: call.muted, deafened: call.deafened });
+    renderControls();
+  }
+  document.body.classList.toggle('streamer-on', S.streamer);
+  renderSidebar();
+  toast(S.streamer ? '🔴 Modo streamer LIGADO — microfone e áudio desligados.' : '🟢 Modo streamer desligado — você voltou a falar e ouvir.');
+}
 function applyDeafen() { call.peers.forEach((p) => { if (p.audioEl) p.audioEl.muted = call.deafened; if (p.screenAudioEl) p.screenAudioEl.muted = call.deafened; }); }
 function toggleDeafen() {
   if (!call) return;
+  S.streamer = false;
   call.deafened = !call.deafened;
   applyDeafen();
   if (call.deafened && call.audioTrack) call.muted = true;
@@ -1321,7 +1343,7 @@ function inviteDialog() {
     <p class="hint" style="margin-top:12px">Código: <b>${esc(s.invite_code)}</b></p>
     <div class="foot"><button class="btn ghost" id="inv-close">Fechar</button></div>`);
   $('#inv-copy', m).onclick = () => copyText(link);
-  $('#inv-share', m)?.addEventListener('click', () => navigator.share({ title: s.name, text: `Entra no meu servidor ${s.name} no GlobalPath!`, url: link }).catch(() => {}));
+  $('#inv-share', m)?.addEventListener('click', () => navigator.share({ title: s.name, text: `Entra no meu servidor ${s.name} no Lumix!`, url: link }).catch(() => {}));
   $('#inv-close', m).onclick = closeModal;
 }
 async function copyText(t) {
@@ -1912,6 +1934,7 @@ const SHORTCUTS = [
   ['quick', 'Busca rápida (servidores, canais e conversas)', 'Ctrl+K'],
   ['mute', 'Silenciar / ativar microfone', 'Ctrl+Alt+M'],
   ['deafen', 'Desativar / ativar áudio', 'Ctrl+Alt+D'],
+  ['streamer', 'Modo streamer (muta e para de ouvir)', 'F9'],
   ['camera', 'Ligar / desligar câmera', 'Ctrl+Alt+C'],
   ['screen', 'Compartilhar tela', 'Ctrl+Alt+S'],
   ['fullscreen', 'Tela cheia da transmissão', 'Ctrl+Alt+F'],
@@ -1977,6 +2000,7 @@ const ACTIONS = {
   quick: () => quickSwitcher(),
   mute: () => (call ? toggleMute() : toast('Você não está em uma chamada.')),
   deafen: () => (call ? toggleDeafen() : toast('Você não está em uma chamada.')),
+  streamer: () => toggleStreamer(),
   camera: () => (call ? toggleCamera() : toast('Você não está em uma chamada.')),
   screen: () => (call ? toggleScreen() : toast('Você não está em uma chamada.')),
   leave: () => call && leaveCall(),
@@ -2023,8 +2047,8 @@ document.addEventListener('keydown', (e) => {
   if (combo === 'Shift+?' || combo === '?') { if (!typing) { e.preventDefault(); shortcutsHelp(); } return; }
   const action = Object.keys(ACTIONS).find((k) => KEYS[k] && KEYS[k] === combo);
   if (action) {
-    if (typing && !/Ctrl|Alt/.test(combo)) return;
-    if ($('#modal-root').innerHTML && !['quick', 'mute', 'deafen'].includes(action)) closeModal();
+    if (typing && !/Ctrl|Alt/.test(combo) && !/^F\d{1,2}$/.test(combo)) return;
+    if ($('#modal-root').innerHTML && !['quick', 'mute', 'deafen', 'streamer'].includes(action)) closeModal();
     e.preventDefault();
     ACTIONS[action]();
     return;
@@ -2035,7 +2059,7 @@ document.addEventListener('keydown', (e) => {
 document.addEventListener('keyup', (e) => { if (KEYS.ptt.on && e.code === KEYS.ptt.code) setPtt(false); }, true);
 
 function shortcutsHelp() {
-  const m = openModal(`<h2>Teclas de atalho</h2><p class="sub">Funcionam com o GlobalPath aberto e em foco. Mude as teclas em Configurações → Atalhos.</p>
+  const m = openModal(`<h2>Teclas de atalho</h2><p class="sub">Funcionam com o Lumix aberto e em foco. Mude as teclas em Configurações → Atalhos.</p>
     <div class="keys-list">
       ${SHORTCUTS.map(([k, label]) => `<div class="key-row"><span>${label}</span><span>${keyLabel(KEYS[k])}</span></div>`).join('')}
       <div class="key-row"><span>Apertar para falar ${KEYS.ptt.on ? '' : '<small class="hint">(desligado)</small>'}</span><span><kbd>${esc(codeLabel(KEYS.ptt.code))}</kbd></span></div>
@@ -2093,7 +2117,7 @@ function usKeys(el) {
         if (e.key === 'Escape') { stopCapture(); return usKeys(el); }
         if (e.key === 'Backspace' || e.key === 'Delete') { KEYS[b.dataset.key] = ''; saveKeys(); stopCapture(); return usKeys(el); }
         const c = comboOf(e); if (!c) return;
-        if (!/Ctrl|Alt/.test(c)) { b.innerHTML = 'Use Ctrl ou Alt junto'; return; }
+        if (!/Ctrl|Alt/.test(c) && !/^(Shift\+)?F\d{1,2}$/.test(c)) { b.innerHTML = 'Use Ctrl, Alt ou uma tecla F1–F12'; return; }
         const clash = SHORTCUTS.find(([k]) => k !== b.dataset.key && KEYS[k] === c);
         if (clash) KEYS[clash[0]] = '';
         KEYS[b.dataset.key] = c; saveKeys(); stopCapture(); usKeys(el);
