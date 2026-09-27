@@ -36,6 +36,15 @@ As chamadas são diretas entre os navegadores (WebRTC). Na maioria das redes fun
 ICE_SERVERS=[{"urls":"stun:stun.l.google.com:19302"},{"urls":"turn:SEU-SERVIDOR:80","username":"USUARIO","credential":"SENHA"}]
 ```
 
+## IA que monta o servidor
+Sem configurar nada, o botão **Montar com IA** usa um assistente básico que entende palavras-chave (jogos, clã, RP, live, música, estudos…).
+Para usar uma IA de verdade, crie uma chave e coloque no Render (**Environment → Add Environment Variable**):
+
+- **Gemini (tem plano grátis):** crie a chave em https://aistudio.google.com/apikey e adicione `GEMINI_API_KEY` = sua chave.
+- **Claude (pago):** crie a chave em https://console.anthropic.com e adicione `ANTHROPIC_API_KEY` = sua chave.
+
+Opcional: `GEMINI_MODEL` ou `AI_MODEL` para escolher o modelo.
+
 ## O que tem no app
 - Cadastro e login (e-mail e senha), troca de senha
 - Perfil: nome de exibição e foto
@@ -44,6 +53,10 @@ ICE_SERVERS=[{"urls":"stun:stun.l.google.com:19302"},{"urls":"turn:SEU-SERVIDOR:
 - Chat em tempo real com links clicáveis, excluir mensagem e carregar mensagens antigas
 - Chamadas: microfone, silenciar áudio, câmera, compartilhar tela, tela cheia, indicador de quem está falando, lista de quem está na sala
 - Voz e vídeo: escolher microfone, saída de áudio e câmera, testar microfone e câmera, cancelamento de eco e supressão de ruído
+- Conversas privadas (mensagens diretas) com contador de não lidas
+- Cargos com cores e permissões, categorias, canais privados e só leitura, modelo streamer
+- IA que monta o servidor do seu jeito
+- Teclas de atalho configuráveis (aperte `?` no site) e "apertar para falar"
 - Funciona no celular (menu lateral)
 
 ## Estrutura
