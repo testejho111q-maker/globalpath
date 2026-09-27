@@ -87,8 +87,9 @@ async function api(path, opts = {}) {
   let data = null;
   try { data = await res.json(); } catch { /* sem corpo */ }
   if (!res.ok) {
+    if (data?.pending && S.me && S.me.status !== 'pending') { S.me.status = 'pending'; setTimeout(renderPending); }
     const e = new Error(data?.error || 'Algo deu errado. Tente de novo.');
-    e.status = res.status;
+    e.status = res.status; e.data = data;
     throw e;
   }
   return data;
@@ -190,8 +191,11 @@ async function route() {
     S.dmId = null;
     await openServer(m[1], m[2]);
   } else if (dm && S.dms.some((d) => d.id === dm[1])) {
-    S.serverId = null; S.channelId = null; S.dmId = dm[1];
+    S.serverId = null; S.channelId = null; S.dmId = dm[1]; S.homeView = 'friends';
     renderApp();
+  } else if (/^\/admin(\/|$)/.test(p) && S.me.is_admin) {
+    S.serverId = null; S.channelId = null; S.dmId = null; S.homeView = 'admin';
+    renderAdmin(p.split('/')[2] || 'overview');
   } else {
     S.serverId = null; S.channelId = null; S.dmId = null;
     S.homeView = p === '/requests' ? 'requests' : 'friends';
@@ -217,10 +221,12 @@ function renderAuth(mode = 'login') {
       <div class="field"><label>Senha</label><input class="input" name="password" type="password" autocomplete="${isLogin ? 'current-password' : 'new-password'}" required></div>
       <div class="error-text" id="auth-err"></div>
       <button class="btn primary block" type="submit">${isLogin ? 'Entrar' : 'Criar conta'}</button>
+      ${isLogin ? '<div class="switch-link" style="margin-top:10px"><button type="button" id="auth-forgot">Esqueci minha senha</button></div>' : ''}
       <div class="switch-link">${isLogin ? 'Precisa de uma conta? <button type="button" id="auth-switch">Cadastre-se</button>' : 'Já tem uma conta? <button type="button" id="auth-switch">Entrar</button>'}</div>
     </form>
   </div>`;
   $('#auth-switch').onclick = () => renderAuth(isLogin ? 'register' : 'login');
+  $('#auth-forgot')?.addEventListener('click', () => forgotDialog($('[name=email]').value));
   const un = $('[name=username]');
   if (un) {
     let touched = false;
@@ -264,11 +270,15 @@ function render2fa(ticket) {
 }
 
 async function startSession() {
+  if (S.me?.status === 'pending') return renderPending();
   await loadBlocks();
   [S.servers, S.dms] = await Promise.all([api('/api/servers'), api('/api/dms').catch(() => [])]);
   await loadFriends();
   connectSocket();
   route();
+  renderAnnouncement();
+  if (S.me.is_admin) admPing();
+  showNotices();
 }
 
 async function logout() {
@@ -311,7 +321,19 @@ function connectSocket() {
   });
   socket.on('session:ended', () => { toast('Sua sessão foi encerrada em outro aparelho.', true); setTimeout(() => location.reload(), 1200); });
   socket.on('blocks:update', () => loadBlocks());
-  socket.on('admin:report', () => toast('🛡️ Nova denúncia para a equipe analisar.'));
+  socket.on('admin:report', () => { admPing(); toast('🛡️ Nova denúncia para a equipe analisar.'); });
+  socket.on('admin:signup', ({ name, username }) => { admPing(); toast(`🆕 ${name} (@${username}) se cadastrou e está esperando liberação.`); });
+  socket.on('admin:support', ({ subject }) => { admPing(); toast(`💬 Suporte: ${subject}`); });
+  socket.on('notice', (n) => { (S.me.notices ||= []).push({ ...n, at: new Date().toISOString() }); showNotices(); });
+  socket.on('updates:new', ({ title }) => { S.me.updates_unseen = (S.me.updates_unseen || 0) + 1; renderSidebar(); toast(`📣 Novidade da Lumix: ${title}`); });
+  socket.on('support:reply', ({ subject, status }) => toast(status === 'resolvido' ? `✅ Seu pedido "${subject}" foi marcado como resolvido.` : `💬 A equipe respondeu seu pedido "${subject}". Veja em Configurações → Suporte.`));
+  socket.on('server:suspended', ({ server_id, suspended }) => { const sv = S.servers.find((x) => x.id === server_id); if (sv) { sv.suspended = suspended; toast(suspended ? `A comunidade "${sv.name}" foi suspensa pela equipe da Lumix.` : `A comunidade "${sv.name}" foi reativada.`, suspended); if (S.serverId === server_id) navigate(suspended ? '/' : `/s/${server_id}`); renderRail(); } });
+  socket.on('me:refresh', async () => {
+    try { S.me = await api('/api/me'); } catch { return; }
+    renderRail();
+    if (location.pathname.startsWith('/admin')) { if (S.me.is_admin) renderAdmin(S.admSection); else navigate('/'); }
+  });
+  socket.on('announcement', ({ text }) => { S.me.announcement = text; renderAnnouncement(); });
   socket.on('friends:request', ({ from, message }) => {
     toast(`👋 ${from.display_name} quer ser seu amigo${message ? `: “${message}”` : ''}`);
   });
@@ -433,7 +455,8 @@ function renderRail() {
       <div class="rail-item ${s.id === S.serverId ? 'active' : ''}" data-tip="${esc(s.name)}"><span class="pill"></span>
         <button data-go="/s/${s.id}" aria-label="${esc(s.name)}">${serverIconHtml(s)}</button></div>`).join('')}
     <div class="rail-item" data-tip="Criar servidor"><button class="rail-add" id="rail-create">${icon('plus')}</button></div>
-    <div class="rail-item" data-tip="Entrar com convite"><button class="rail-add" id="rail-join">${icon('link')}</button></div>`;
+    <div class="rail-item" data-tip="Entrar com convite"><button class="rail-add" id="rail-join">${icon('link')}</button></div>
+    ${S.me?.is_admin ? `<div class="rail-item ${S.homeView === 'admin' && !S.serverId ? 'active' : ''}" data-tip="Painel de controle"><span class="pill"></span><button class="rail-add admin-btn" data-go="/admin">${icon('shield')}</button>${S.adminPending ? `<span class="rail-badge">${S.adminPending > 99 ? '99+' : S.adminPending}</span>` : ''}</div>` : ''}`;
   $$('[data-go]', el).forEach((b) => { b.onclick = () => { setNav(false); navigate(b.dataset.go); }; });
   $('#rail-create').onclick = () => createServerDialog();
   $('#rail-join').onclick = () => joinDialog();
@@ -533,6 +556,7 @@ function renderSidebar() {
   });
   $('#server-menu-btn')?.addEventListener('click', (e) => serverMenu(e.currentTarget));
   $('#dm-new')?.addEventListener('click', newDmDialog);
+  $('#home-news')?.addEventListener('click', () => { setNav(false); openUpdates(); });
   $('#home-search')?.addEventListener('click', () => quickSwitcher());
   $('#me-btn').onclick = () => userSettings('profile');
   $('#ub-settings').onclick = () => userSettings('profile');
@@ -922,6 +946,7 @@ function renderHomeSidebar() {
     <div class="channels">
       <button class="channel home-link ${!S.dmId && S.homeView === 'friends' ? 'active' : ''}" data-go="/">${icon('users')}<span class="n">Amigos</span>${pendingCount() ? `<span class="unread">${pendingCount()}</span>` : ''}</button>
       <button class="channel home-link ${!S.dmId && S.homeView === 'requests' ? 'active' : ''}" data-go="/requests">${icon('mail')}<span class="n">Solicitações de mensagens</span>${reqs ? `<span class="unread">${reqs}</span>` : ''}</button>
+      <button class="channel home-link" id="home-news">${icon('megaphone')}<span class="n">Novidades da Lumix</span>${S.me?.updates_unseen ? `<span class="unread">${S.me.updates_unseen}</span>` : ''}</button>
       <div class="cat"><span class="cat-name" style="cursor:default"><span>Mensagens diretas</span></span><span class="cat-actions" style="opacity:1"><button class="icon-btn" id="dm-new" title="Nova conversa">${icon('plus')}</button></span></div>
       ${normal.length ? normal.map((d) => `
         <button class="channel dm-row ${d.id === S.dmId ? 'active' : ''}" data-go="/dm/${d.id}">
@@ -1170,6 +1195,7 @@ async function joinCall(cid, opts = {}) {
     res.peers.forEach((p) => createPeer(p.socket_id, true));
   });
   call.speakTimer = setInterval(checkSpeaking, 150);
+  call.statsTimer = setInterval(measurePeers, 2000);
   renderSidebar();
   if (dm) fillDmCallSlot(); else renderMain();
 }
@@ -1182,7 +1208,7 @@ function leaveCall(silent) {
   c.peers.forEach((_, id) => closePeerOf(c, id));
   [c.audioTrack, c.camTrack, c.screenTrack, c.screenAudioTrack].forEach((t) => t?.stop());
   c.focusKey = null;
-  clearInterval(c.speakTimer);
+  clearInterval(c.speakTimer); clearInterval(c.statsTimer);
   clearTimeout(c.ringTimer);
   speakers.clear();
   if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
@@ -1203,7 +1229,7 @@ function playAudio(el) {
   });
 }
 function createPeer(peerId, initiator) {
-  const pc = new RTCPeerConnection({ iceServers: S.iceServers });
+  const pc = new RTCPeerConnection({ iceServers: S.iceServers, bundlePolicy: 'max-bundle', iceCandidatePoolSize: 2 });
   const peer = { pc, pending: [], audio: new MediaStream(), cam: new MediaStream(), screen: new MediaStream(), screenAudio: new MediaStream(), audioEl: null, screenAudioEl: null };
   call.peers.set(peerId, peer);
 
@@ -1225,6 +1251,8 @@ function createPeer(peerId, initiator) {
     const target = [peer.audio, peer.cam, peer.screen, peer.screenAudio][idx] || peer.screen;
     target.getTracks().forEach((t) => target.removeTrack(t));
     target.addTrack(e.track);
+    // menos atraso: pede para o navegador tocar o que chega o mais rápido possível
+    try { if ('jitterBufferTarget' in e.receiver) e.receiver.jitterBufferTarget = idx === 2 ? 60 : 0; else e.receiver.playoutDelayHint = 0; } catch { /* navegador sem suporte */ }
     // só mostra o vídeo quando a imagem realmente começa a chegar (evita tela preta)
     const redraw = () => { if (call) { call.gridKey = null; updateCallGrid(); } };
     e.track.onunmute = redraw; e.track.onmute = redraw;
@@ -1234,6 +1262,8 @@ function createPeer(peerId, initiator) {
   };
   pc.oniceconnectionstatechange = () => {
     peer.state = pc.iceConnectionState;
+    if (['connected', 'completed'].includes(pc.iceConnectionState)) { peer.everConnected = true; peer.downSince = 0; }
+    else if (peer.everConnected && !peer.downSince) peer.downSince = Date.now();
     if (call) { call.gridKey = null; updateCallGrid(); }
     if (pc.iceConnectionState === 'failed') {
       peer.fails = (peer.fails || 0) + 1;
@@ -1264,9 +1294,60 @@ function applyTracks(peer) {
   const t = peer.pc.getTransceivers();
   if (t.length < 3) return;
   t[0].sender.replaceTrack(call.audioTrack || null).catch(() => {});
-  t[1].sender.replaceTrack(call.camTrack || null).catch(() => {});
-  t[2].sender.replaceTrack(call.screenTrack || null).catch(() => {});
+  t[1].sender.replaceTrack(call.camTrack || null).then(() => tuneSender(t[1].sender, 'cam')).catch(() => {});
+  t[2].sender.replaceTrack(call.screenTrack || null).then(() => tuneSender(t[2].sender, 'screen')).catch(() => {});
   t[3]?.sender.replaceTrack(call.screenAudioTrack || null).catch(() => {});
+}
+// limita a taxa de envio: com muita gente ou gente longe, vídeo pesado demais trava e atrasa
+async function tuneSender(sender, kind) {
+  if (!sender?.track || !sender.getParameters) return;
+  try {
+    const p = sender.getParameters();
+    if (!p.encodings?.length) p.encodings = [{}];
+    const n = Math.max(1, call?.peers.size || 1);
+    const fluid = callSettings().screenMode !== 'detail';
+    if (kind === 'screen') {
+      p.encodings[0].maxBitrate = Math.round((fluid ? 2_500_000 : 3_500_000) / Math.min(n, 3));
+      p.encodings[0].maxFramerate = fluid ? 30 : 15;
+      p.degradationPreference = fluid ? 'maintain-framerate' : 'maintain-resolution';
+    } else {
+      p.encodings[0].maxBitrate = Math.round(1_000_000 / Math.min(n, 3));
+      p.encodings[0].maxFramerate = 30;
+      p.degradationPreference = 'balanced';
+    }
+    await sender.setParameters(p);
+  } catch { /* navegador não deixou ajustar */ }
+}
+// mede o atraso (ping) de cada pessoa e se a conexão é direta ou passa por servidor
+async function measurePeers() {
+  if (!call) return;
+  for (const [sid, peer] of call.peers) {
+    try {
+      const stats = await peer.pc.getStats();
+      let pair = null; const cands = {};
+      stats.forEach((r) => {
+        if (r.type === 'transport' && r.selectedCandidatePairId) pair = stats.get(r.selectedCandidatePairId) || pair;
+        if (r.type === 'candidate-pair' && r.nominated && r.state === 'succeeded' && !pair) pair = r;
+        if (r.type === 'local-candidate' || r.type === 'remote-candidate') cands[r.id] = r;
+      });
+      if (!pair) { peer.ping = null; continue; }
+      peer.ping = pair.currentRoundTripTime != null ? Math.round(pair.currentRoundTripTime * 1000) : null;
+      peer.relay = cands[pair.localCandidateId]?.candidateType === 'relay' || cands[pair.remoteCandidateId]?.candidateType === 'relay';
+      let inbound = 0; stats.forEach((r) => { if (r.type === 'inbound-rtp' && r.bytesReceived) inbound += r.bytesReceived; });
+      peer.flowing = inbound > (peer.lastBytes || 0); peer.lastBytes = inbound;
+    } catch { /* conexão fechada */ }
+  }
+  $$('#call-grid [data-ping]').forEach((el) => {
+    const peer = call.peers.get(el.dataset.ping);
+    if (!peer || peer.ping == null) { el.textContent = ''; el.className = 'tile-ping'; return; }
+    el.textContent = `${peer.ping} ms${peer.relay ? ' · via servidor' : ''}`;
+    el.className = `tile-ping ${peer.ping > 300 ? 'bad' : peer.ping > 150 ? 'mid' : 'good'}`;
+    el.title = peer.relay ? 'A conexão passa por um servidor de apoio (TURN). Quanto mais longe ele estiver, maior o atraso.' : 'Conexão direta entre vocês.';
+  });
+  // se a mídia está chegando, não fica mostrando "Conectando…"
+  let changed = false;
+  call.peers.forEach((peer) => { const ok = peer.flowing || peer.everConnected; if (ok !== peer.okShown) { peer.okShown = ok; changed = true; } });
+  if (changed) { call.gridKey = null; updateCallGrid(); }
 }
 async function onSignal({ from, data }) {
   if (!call) return;
@@ -1376,7 +1457,7 @@ async function toggleScreen() {
   } else {
     try {
       const st = await navigator.mediaDevices.getDisplayMedia({
-        video: { frameRate: 30 },
+        video: { frameRate: { ideal: 30, max: 30 }, width: { max: 1920 }, height: { max: 1080 } },
         audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
         systemAudio: 'include', selfBrowserSurface: 'exclude',
       });
@@ -1384,7 +1465,7 @@ async function toggleScreen() {
       call.screenTrack = st.getVideoTracks()[0];
       call.screenAudioTrack = st.getAudioTracks()[0] || null;
       if (!call.screenAudioTrack) toast('Transmitindo sem som. Para ter áudio, marque "Compartilhar áudio" ao escolher a tela ou aba.');
-      call.screenTrack.contentHint = 'detail';
+      call.screenTrack.contentHint = callSettings().screenMode === 'detail' ? 'detail' : 'motion';
       call.screenTrack.onended = () => { if (call?.screenTrack) toggleScreen(); };
     } catch { return; }
   }
@@ -1407,8 +1488,10 @@ function updateCallGrid() {
     const camOn = mine ? !!call.camTrack : p.camera && live(peer?.cam);
     const scrWait = !mine && p.screen && !live(peer?.screen);
     const scrOn = mine ? !!call.screenTrack : p.screen && live(peer?.screen);
-    p.connecting = !mine && peer && !['connected', 'completed'].includes(peer.pc.iceConnectionState);
-    p.failed = !mine && peer?.pc.iceConnectionState === 'failed';
+    const up = peer && (['connected', 'completed'].includes(peer.pc.iceConnectionState) || peer.flowing);
+    p.connecting = !mine && !!peer && !up && !peer.everConnected;
+    p.reconnecting = !mine && !!peer && !up && !!peer.everConnected && peer.downSince && Date.now() - peer.downSince > 4000;
+    p.failed = !mine && peer?.pc.iceConnectionState === 'failed' && !peer.everConnected;
     if (scrWait) tiles.push({ key: p.socket_id + ':sw', p, kind: 'wait', mine });
     if (scrOn) tiles.push({ key: p.socket_id + ':s', p, kind: 'screen', mine });
     tiles.push({ key: p.socket_id + ':c', p, kind: camOn ? 'cam' : 'avatar', mine });
@@ -1417,7 +1500,7 @@ function updateCallGrid() {
   if (call.focusKey && !tiles.some((t) => t.key === call.focusKey)) exitFocus(true);
   const shown = call.focusKey ? tiles.filter((t) => t.key === call.focusKey) : tiles.slice();
   grid.classList.toggle('focus', !!call.focusKey);
-  const key = (call.focusKey || '') + shown.map((t) => t.key + t.kind + t.p.muted + t.p.display_name + t.p.avatar_url + t.p.connecting + t.p.failed).join('|');
+  const key = (call.focusKey || '') + shown.map((t) => t.key + t.kind + t.p.muted + t.p.display_name + t.p.avatar_url + t.p.connecting + t.p.reconnecting + t.p.failed).join('|');
   const dmUser = call.dm ? S.dms.find((d) => d.id === call.dm)?.user : null;
   $('#call-alone').textContent = parts.length <= 1 ? (dmUser ? `Esperando ${dmUser.display_name} entrar…` : 'Você está sozinho aqui. Chame seus amigos para este canal.') : '';
   if (key === call.gridKey) return;
@@ -1431,7 +1514,8 @@ function updateCallGrid() {
   grid.innerHTML = tiles.map((t) => `
     <div class="tile ${t.kind === 'screen' ? 'screen' : ''} ${t.mine && t.kind === 'cam' ? 'mirror' : ''}" data-sock="${t.kind === 'screen' ? '' : (t.mine ? 'local' : t.p.socket_id)}" data-key="${t.key}">
       ${t.kind === 'avatar' ? avatarHtml(t.p) : t.kind === 'wait' ? `<div class="tile-wait"><div class="spinner"></div><span>${t.p.failed ? 'Não conectou 😕' : 'Carregando a transmissão…'}</span></div>` : '<video autoplay playsinline muted></video>'}
-      ${t.p.failed ? '<div class="tile-status bad">Sem conexão</div>' : t.p.connecting ? '<div class="tile-status">Conectando…</div>' : ''}
+      ${t.p.failed ? '<div class="tile-status bad">Sem conexão</div>' : t.p.connecting ? '<div class="tile-status">Conectando…</div>' : t.p.reconnecting ? '<div class="tile-status">Reconectando…</div>' : ''}
+      ${!t.mine && t.kind !== 'wait' ? `<div class="tile-ping" data-ping="${t.p.socket_id}"></div>` : ''}
       <div class="label">${t.p.muted ? `<span class="red">${icon('micOff')}</span>` : icon('mic')}${esc(t.p.display_name)}${t.mine ? ' (você)' : ''}${t.kind === 'screen' || t.kind === 'wait' ? ' — tela' : ''}</div>
       <button class="icon-btn fs" title="${call.focusKey ? 'Sair da tela cheia' : 'Tela cheia'}">${icon(call.focusKey ? 'shrink' : 'expand')}</button>
     </div>`).join('');
@@ -1494,10 +1578,10 @@ function checkSpeaking() {
 }
 
 // =============================================================== diálogos
-function openModal(html, { wide = false, onClose } = {}) {
+function openModal(html, { wide = false, big = false, onClose } = {}) {
   closeModal();
   const root = $('#modal-root');
-  root.innerHTML = `<div class="overlay"><div class="modal ${wide ? 'wide' : ''}" role="dialog">${html}</div></div>`;
+  root.innerHTML = `<div class="overlay"><div class="modal ${wide ? 'wide' : ''} ${big ? 'big' : ''}" role="dialog">${html}</div></div>`;
   const ov = root.firstElementChild;
   ov.addEventListener('mousedown', (e) => { if (e.target === ov) closeModal(); });
   root._onClose = onClose;
@@ -1770,6 +1854,7 @@ function serverMenu(anchor) {
     ${p.manage_channels ? `<button data-a="text">Criar canal ${icon('hash')}</button><button data-a="category">Criar categoria ${icon('folder')}</button>` : ''}
     ${s.is_owner ? `<button data-a="ai">Montar com IA ${icon('sparkle')}</button><button data-a="template">Aplicar modelo streamer ${icon('folder')}</button>` : ''}
     <button data-a="members">Membros ${icon('users')}</button>
+    ${s.is_owner ? '' : `<button data-a="report">Denunciar comunidade ${icon('flag')}</button>`}
     <hr>
     ${s.is_owner ? `<button data-a="delete" class="red">Excluir servidor ${icon('trash')}</button>` : `<button data-a="leave" class="red">Sair do servidor ${icon('door')}</button>`}`;
   document.body.appendChild(menu);
@@ -1788,6 +1873,7 @@ function serverMenu(anchor) {
     if (a === 'template') serverSettings('template');
     if (a === 'ai') aiBuildDialog({ existing: true });
     if (a === 'delete') deleteServer();
+    if (a === 'report') reportDialog({ type: 'server', target: s.id, name: s.name });
     if (a === 'leave') {
       if (!confirm(`Sair de "${s.name}"?`)) return;
       try { await api(`/api/servers/${s.id}/leave`, { method: 'POST' }); } catch (err) { toast(err.message, true); }
@@ -2019,17 +2105,18 @@ function userSettings(tab = 'profile') {
     <nav class="settings-nav"><h4>Configurações</h4>
       <button data-tab="profile">Perfil</button><button data-tab="privacy">Privacidade</button><button data-tab="security">Segurança</button>
       <button data-tab="devices">Dispositivos</button><button data-tab="call">Voz e vídeo</button><button data-tab="keys">Atalhos</button>
-      <button data-tab="report">Relatar problema</button>${S.me.is_admin ? '<button data-tab="admin">Denúncias (equipe)</button>' : ''}
+      <button data-tab="report">Suporte</button>${S.me.is_admin ? '<button data-tab="panel">Painel de controle</button>' : ''}
       <button class="red" data-tab="logout">Sair</button></nav>
     <section class="settings-body"><button class="icon-btn close" id="us-close">${icon('x')}</button><div id="us-body"></div></section>`,
   { wide: true, onClose: () => { capturing = null; cleanup.splice(0).forEach((f) => f()); } });
   $('#us-close', m).onclick = closeModal;
   const show = (t) => {
     if (t === 'logout') { closeModal(); return logout(); }
+    if (t === 'panel') { closeModal(); return navigate('/admin'); }
     cleanup.splice(0).forEach((f) => f());
     $$('[data-tab]', m).forEach((b) => b.classList.toggle('active', b.dataset.tab === t));
     capturing = null;
-    ({ profile: usProfile, privacy: usPrivacy, security: usSecurity, devices: usDevices, call: usCall, keys: usKeys, report: usReport, admin: usAdmin, account: usSecurity })[t]($('#us-body', m), cleanup);
+    ({ profile: usProfile, privacy: usPrivacy, security: usSecurity, devices: usDevices, call: usCall, keys: usKeys, report: (b) => usSupport(b), account: usSecurity })[t]($('#us-body', m), cleanup);
   };
   $$('[data-tab]', m).forEach((b) => { b.onclick = () => show(b.dataset.tab); });
   show(tab);
@@ -2154,11 +2241,12 @@ async function loadBlocks() {
 
 const REPORT_REASONS = {
   message: ['Spam ou golpe', 'Ofensa ou assédio', 'Conteúdo +18 ou violento', 'Dados pessoais expostos', 'Outro motivo'],
+  server: ['Golpes ou fraudes', 'Conteúdo ilegal ou +18 sem aviso', 'Discurso de ódio ou assédio', 'Pirataria ou venda proibida', 'Outro motivo'],
   user: ['Spam ou golpe', 'Ofensa ou assédio', 'Se passando por outra pessoa', 'Conta de menor com conteúdo impróprio', 'Outro motivo'],
 };
 function reportDialog({ type, target, name }) {
   const reasons = REPORT_REASONS[type];
-  const m = openModal(`<h2>${type === 'message' ? 'Denunciar mensagem' : `Denunciar ${esc(name || 'perfil')}`}</h2>
+  const m = openModal(`<h2>${type === 'message' ? 'Denunciar mensagem' : type === 'server' ? `Denunciar a comunidade ${esc(name || '')}` : `Denunciar ${esc(name || 'perfil')}`}</h2>
     <p class="sub">A equipe da Lumix vai analisar. Quem você denunciou não fica sabendo que foi você.</p>
     <div class="reasons">${reasons.map((r, i) => `<label class="reason"><input type="radio" name="reason" value="${esc(r)}" ${i === 0 ? 'checked' : ''}>${esc(r)}</label>`).join('')}</div>
     <div class="field" style="margin-top:12px"><label>Detalhes (opcional)</label><textarea class="input" id="rp-details" rows="3" maxlength="1500" style="height:auto;padding:10px 12px"></textarea></div>
@@ -2171,24 +2259,6 @@ function reportDialog({ type, target, name }) {
       await api('/api/reports', { method: 'POST', body: { type, target, reason: $('[name=reason]:checked', m).value, details: $('#rp-details', m).value } });
       closeModal(); toast('Denúncia enviada. Obrigado por ajudar a manter a Lumix segura!');
     } catch (err) { $('#rp-err', m).textContent = err.message; e.target.disabled = false; }
-  };
-}
-
-function usReport(el) {
-  el.innerHTML = `<h3>Relatar problema</h3>
-    <p class="hint" style="margin:-8px 0 14px">Achou um erro ou algo não funcionou? Conta pra gente. Quanto mais detalhe, mais rápido a gente arruma.</p>
-    <div class="field"><label>O que aconteceu?</label><select class="input" id="bug-kind">
-      <option>Cadastro ou login</option><option>Mensagens</option><option>Chamadas de voz/vídeo</option><option>Perfil ou amigos</option><option>Servidores e canais</option><option>Celular</option><option>Sugestão de melhoria</option><option>Outro</option></select></div>
-    <div class="field"><label>Descreva</label><textarea class="input" id="bug-text" rows="6" maxlength="1500" style="height:auto;padding:10px 12px" placeholder="O que você fez, o que esperava e o que aconteceu"></textarea></div>
-    <div class="error-text" id="bug-err"></div>
-    <button class="btn primary" id="bug-send">Enviar</button>`;
-  $('#bug-send', el).onclick = async (e) => {
-    e.target.disabled = true; $('#bug-err', el).textContent = '';
-    try {
-      await api('/api/reports', { method: 'POST', body: { type: 'bug', reason: $('#bug-kind', el).value, details: $('#bug-text', el).value, page: `${location.pathname} · ${navigator.userAgent.slice(0, 120)}` } });
-      $('#bug-text', el).value = ''; toast('Recebido! Obrigado por ajudar a melhorar a Lumix.');
-    } catch (err) { $('#bug-err', el).textContent = err.message; }
-    e.target.disabled = false;
   };
 }
 
@@ -2291,31 +2361,6 @@ async function usDevices(el) {
   $('#end-all', el)?.addEventListener('click', async () => { if (!confirm('Desconectar todos os outros aparelhos?')) return; await api('/api/sessions/logout-others', { method: 'POST' }); toast('Pronto, só este aparelho está conectado.'); usDevices(el); });
 }
 
-async function usAdmin(el) {
-  el.innerHTML = `<h3>Denúncias e relatos</h3><div class="spinner"></div>`;
-  let list = [];
-  try { list = await api('/api/admin/reports'); } catch (e) { el.innerHTML = `<p class="error-text">${esc(e.message)}</p>`; return; }
-  const tag = { message: 'Mensagem', user: 'Perfil', bug: 'Problema', server: 'Servidor' };
-  el.innerHTML = `<h3>Denúncias e relatos — ${list.filter((r) => r.status === 'aberta').length} abertas</h3>
-    ${list.length ? list.map((r) => `<div class="report ${r.status}">
-      <div class="report-top"><span class="badge">${tag[r.type]}</span><b>${esc(r.reason || '')}</b><span class="spacer"></span><small>${new Date(r.created_at).toLocaleString('pt-BR')}</small></div>
-      <p class="hint">Enviado por ${esc(r.reporter_user?.display_name || '?')} (@${esc(r.reporter_user?.username || '')})${r.target_person ? ` · sobre <b>${esc(r.target_person.display_name)}</b> (@${esc(r.target_person.username)})${r.target_person.banned ? ' — SUSPENSO' : ''}` : ''}</p>
-      ${r.snapshot ? `<blockquote>${esc(r.snapshot.content || '')}${r.snapshot.attachments?.length ? ` <i>(+${r.snapshot.attachments.length} anexo)</i>` : ''}</blockquote>` : ''}
-      ${r.details ? `<p>${esc(r.details)}</p>` : ''}${r.page ? `<p class="hint">${esc(r.page)}</p>` : ''}
-      <div class="report-actions">
-        ${r.status !== 'resolvida' ? `<button class="btn" data-st="resolvida" data-id="${r.id}">${icon('check')}Resolvida</button>` : ''}
-        ${r.status !== 'descartada' ? `<button class="btn ghost" data-st="descartada" data-id="${r.id}">Descartar</button>` : ''}
-        ${r.status !== 'aberta' ? `<button class="btn ghost" data-st="aberta" data-id="${r.id}">Reabrir</button>` : ''}
-        ${r.target_person ? `<button class="btn danger" data-ban="${r.target_person.id}" data-banned="${r.target_person.banned ? 1 : 0}">${r.target_person.banned ? 'Tirar suspensão' : 'Suspender conta'}</button>` : ''}
-      </div></div>`).join('') : '<p class="hint">Nenhuma denúncia ainda.</p>'}`;
-  $$('[data-st]', el).forEach((b) => { b.onclick = async () => { await api(`/api/admin/reports/${b.dataset.id}`, { method: 'PATCH', body: { status: b.dataset.st } }); usAdmin(el); }; });
-  $$('[data-ban]', el).forEach((b) => { b.onclick = async () => {
-    const ban = b.dataset.banned !== '1';
-    if (ban && !confirm('Suspender essa conta? A pessoa é desconectada e não consegue mais entrar.')) return;
-    try { await api(`/api/admin/users/${b.dataset.ban}/ban`, { method: 'POST', body: { banned: ban } }); usAdmin(el); } catch (e) { toast(e.message, true); }
-  }; });
-}
-
 async function usCall(el, cleanup) {
   const cs = callSettings();
   el.innerHTML = `<h3>Voz e vídeo</h3><div class="spinner"></div>`;
@@ -2346,10 +2391,13 @@ async function usCall(el, cleanup) {
     <div class="field"><label>Câmera</label><select class="input" id="uc-cam">${opts('videoinput', cs.camId)}</select></div>
     <div class="cam-preview hidden" id="uc-prev"><video autoplay playsinline muted></video></div>
     <button class="btn" id="uc-camtest">Testar câmera</button>
+    <div class="field" style="margin-top:18px"><label>Qualidade da transmissão de tela</label><select class="input" id="uc-scr">
+      <option value="motion" ${cs.screenMode !== 'detail' ? 'selected' : ''}>Fluida — jogos e vídeos (menos atraso)</option>
+      <option value="detail" ${cs.screenMode === 'detail' ? 'selected' : ''}>Nítida — textos e código (pode atrasar mais)</option></select></div>
     <p class="hint" style="margin-top:14px">As mudanças valem na próxima vez que você entrar em uma chamada.</p>`;
   const persist = () => {
     saveCallSettings({ micId: $('#uc-mic', el).value, speakerId: $('#uc-spk', el)?.value || '', camId: $('#uc-cam', el).value,
-      echoCancellation: $('#uc-echo', el).checked, noiseSuppression: $('#uc-noise', el).checked, autoGainControl: $('#uc-gain', el).checked });
+      echoCancellation: $('#uc-echo', el).checked, noiseSuppression: $('#uc-noise', el).checked, autoGainControl: $('#uc-gain', el).checked, screenMode: $('#uc-scr', el).value });
   };
   $$('select, input', el).forEach((x) => x.addEventListener('change', persist));
   $('#uc-spk', el)?.addEventListener('change', (e) => { call?.peers.forEach((p) => p.audioEl?.setSinkId?.(e.target.value).catch(() => {})); });
@@ -2739,6 +2787,738 @@ function usKeys(el) {
     try { localStorage.removeItem('gp_keys'); } catch { /* ignora */ }
     KEYS = loadKeys(); KEYS.ptt = ptt; saveKeys(); usKeys(el); toast('Atalhos restaurados.');
   };
+}
+
+// =============================================================== cadastro pendente, recuperar senha e painel do dono
+function renderPending() {
+  const viaMail = S.me.verify_via === 'email';
+  $('#app').innerHTML = `<div class="auth"><form class="auth-card" id="pend-form">
+    <div class="brand"><img class="brand-logo" src="/logo-192.png" alt=""><span><b>LUMIX</b><small>Liberação do cadastro</small></span></div>
+    <h1>Quase lá, ${esc(S.me.display_name)}!</h1>
+    <p class="sub">${viaMail
+      ? `Mandamos um código de 6 números para <b>${esc(S.me.email)}</b>. Olhe também a caixa de spam.`
+      : 'Seu cadastro está na fila para ser liberado pela equipe da Lumix. Pode deixar esta tela aberta: ela libera sozinha assim que aprovarem.'}</p>
+    ${viaMail ? `<div class="field"><label>Código do e-mail</label><input class="input code-input" name="code" inputmode="numeric" maxlength="6" placeholder="000000" autocomplete="one-time-code"></div>
+    <div class="error-text" id="pend-err"></div>
+    <button class="btn primary block">Liberar minha conta</button>` : '<div class="error-text" id="pend-err"></div>'}
+    <div class="switch-link">${viaMail ? '<button type="button" id="pend-resend">Mandar código de novo</button> · ' : '<button type="button" id="pend-resend">Avisar a equipe de novo</button> · '}<button type="button" id="pend-out">Sair</button></div>
+    <p class="hint" style="text-align:center;margin-top:12px"><span class="spinner sm"></span> Esperando liberação…</p></form></div>`;
+  const done = async () => { clearInterval(S.pendTimer); await startSession(); toast('Conta liberada! Bem-vindo(a) à Lumix 🎉'); };
+  $('#pend-form').onsubmit = async (e) => {
+    e.preventDefault();
+    if (!e.target.code) return;
+    try { S.me = await api('/api/auth/verify', { method: 'POST', body: { code: e.target.code.value } }); if (S.me.status !== 'pending') done(); }
+    catch (err) { $('#pend-err').textContent = err.message; }
+  };
+  $('#pend-resend').onclick = async () => {
+    try { const r = await api('/api/auth/resend', { method: 'POST' }); toast(r.via === 'email' ? 'Código novo enviado para o seu e-mail.' : 'Pedido enviado para a equipe liberar.'); }
+    catch (err) { toast(err.message, true); }
+  };
+  $('#pend-out').onclick = () => { clearInterval(S.pendTimer); logout(); };
+  clearInterval(S.pendTimer);
+  S.pendTimer = setInterval(async () => {
+    try { const me = await api('/api/me'); if (me.status !== 'pending') { S.me = me; done(); } } catch { /* tenta de novo */ }
+  }, 5000);
+}
+
+function forgotDialog(prefill = '') {
+  const m = openModal(`<h2>Esqueci minha senha</h2><p class="sub">Digite seu e-mail. Vamos mandar um código para criar uma senha nova.</p>
+    <div id="fg-1"><div class="field"><label>E-mail</label><input class="input" id="fg-email" type="email" value="${esc(prefill)}"></div>
+      <div class="error-text" id="fg-err"></div><div class="foot"><button class="btn ghost" id="fg-cancel">Cancelar</button><button class="btn primary" id="fg-send">Mandar código</button></div></div>
+    <div id="fg-2" class="hidden"><p class="hint" id="fg-info"></p>
+      <div class="field"><label>Código</label><input class="input code-input" id="fg-code" inputmode="numeric" maxlength="6" placeholder="000000"></div>
+      <div class="field"><label>Senha nova</label><input class="input" id="fg-pass" type="password" minlength="6" autocomplete="new-password"></div>
+      <div class="error-text" id="fg-err2"></div><div class="foot"><button class="btn primary" id="fg-save">Salvar senha e entrar</button></div></div>`);
+  $('#fg-cancel', m).onclick = closeModal;
+  const next = (via) => {
+    $('#fg-1', m).classList.add('hidden'); $('#fg-2', m).classList.remove('hidden');
+    $('#fg-info', m).innerHTML = 'Se existir uma conta com esse e-mail, o código chegou lá (olhe o spam também). Ele vale por 30 minutos.';
+  };
+  $('#fg-send', m).onclick = async (e) => {
+    e.target.disabled = true;
+    try {
+      const r = await api('/api/auth/forgot', { method: 'POST', body: { email: $('#fg-email', m).value } });
+      if (r.via === 'off') { $('#fg-err', m).textContent = 'A recuperação de senha por e-mail ainda não está ativada na Lumix. Por segurança, a equipe não gera códigos manualmente — avise quem administra a Lumix.'; e.target.disabled = false; return; }
+      next(r.via);
+    } catch (err) { $('#fg-err', m).textContent = err.message; }
+    e.target.disabled = false;
+  };
+  $('#fg-save', m).onclick = async () => {
+    try {
+      S.me = await api('/api/auth/reset', { method: 'POST', body: { email: $('#fg-email', m).value, code: $('#fg-code', m).value, password: $('#fg-pass', m).value } });
+      closeModal(); toast('Senha trocada!'); await startSession();
+    } catch (err) { $('#fg-err2', m).textContent = err.message; }
+  };
+}
+
+// ---------------------------------------------------------------- área administrativa (/admin)
+const ADM_NAV = [
+  ['overview', 'Visão geral', 'compass', 1], ['users', 'Usuários', 'users', 1], ['communities', 'Comunidades', 'folder', 1],
+  ['reports', 'Denúncias', 'flag', 1], ['updates', 'Atualizações', 'megaphone', 2], ['support', 'Suporte', 'chat', 1],
+  ['roles', 'Cargos e permissões', 'shield', 1], ['audit', 'Registro de ações', 'file', 1], ['settings', 'Configurações', 'settings', 2],
+];
+const ADM_TITLES = {
+  overview: ['Painel administrativo', 'Acompanhe e gerencie sua comunidade.'], users: ['Usuários', 'Pesquise contas e aplique advertências, suspensões ou banimentos.'],
+  communities: ['Comunidades', 'Consulte comunidades, responsáveis e canais.'], reports: ['Denúncias', 'Fila de moderação: analise, arquive ou aplique uma ação.'],
+  updates: ['Atualizações', 'Publique novidades, correções e avisos no canal oficial.'], support: ['Suporte', 'Pedidos de ajuda da comunidade.'],
+  roles: ['Cargos e permissões', 'Quem faz parte da equipe e o que cada cargo pode fazer.'], audit: ['Registro de ações', 'Tudo o que a equipe fez. Ninguém pode apagar.'],
+  settings: ['Configurações', 'Cadastro, aviso geral e serviços ligados.'],
+};
+const RANK_NAME = { 3: 'Dono', 2: 'Administrador', 1: 'Moderador', 0: 'Membro' };
+const myRank = () => S.me?.staff_rank || 0;
+const admWhen = (d, withYear) => (d ? new Date(d).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', ...(withYear ? { year: '2-digit' } : {}), hour: '2-digit', minute: '2-digit' }) : '—');
+function admRel(d) {
+  if (!d) return '—';
+  const t = new Date(d), n = new Date();
+  const hm = t.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+  if (t.toDateString() === n.toDateString()) return `Hoje, ${hm}`;
+  if (t.toDateString() === new Date(n - 864e5).toDateString()) return `Ontem, ${hm}`;
+  return admWhen(d, true);
+}
+const STATE_CHIP = {
+  ativo: ['Ativo', 'ok'], suspenso: ['Suspenso', 'bad'], banido: ['Banido', 'bad'], pendente: ['Esperando liberação', 'warn'],
+};
+const stateChip = (r) => { const [l, c] = STATE_CHIP[r?.state] || ['—', '']; return `<span class="chip ${c}"><i></i>${l}</span>`; };
+const roleChip = (name) => `<span class="rchip ${name === 'Dono' ? 'owner' : name === 'Administrador' ? 'admin' : name === 'Moderador' ? 'mod' : ''}">${esc(name)}</span>`;
+const EMAIL_STATE = { confirmado: ['Confirmado', 'ok'], nao_confirmado: ['Não confirmado', ''], aguardando: ['Aguardando', 'warn'] };
+const emailChip = (s) => { const [l, c] = EMAIL_STATE[s] || ['—', '']; return `<span class="chip ${c}"><i></i>${l}</span>`; };
+
+// chamada à API com tratamento da exigência de duas etapas
+async function admApi(path, opts) {
+  try { return await api(path, opts); } catch (e) {
+    if (e.data?.need_2fa) { renderAdminGate(e.data.need_2fa); throw Object.assign(new Error(''), { silent: true }); }
+    throw e;
+  }
+}
+const admErr = (e) => { if (!e.silent) toast(e.message, true); };
+function admPager(pg) {
+  if (!pg || pg.pages <= 1) return pg?.total ? `<div class="adm-pager"><span>${pg.total} resultado(s)</span></div>` : '';
+  return `<div class="adm-pager"><span>${pg.total} resultado(s) · página ${pg.page} de ${pg.pages}</span>
+    <button class="btn ghost sm" data-pg="${pg.page - 1}" ${pg.page <= 1 ? 'disabled' : ''}>Anterior</button>
+    <button class="btn ghost sm" data-pg="${pg.page + 1}" ${pg.page >= pg.pages ? 'disabled' : ''}>Próxima</button></div>`;
+}
+function bindPager(root, go) { $$('[data-pg]', root).forEach((b) => { b.onclick = () => go(Number(b.dataset.pg)); }); }
+
+// confirmação com motivo (punições e ações destrutivas)
+function admConfirm({ title, text, danger = true, reason = true, reasonLabel = 'Motivo', days = null, maxDays = 365, typeWord = '', okLabel = 'Confirmar' }) {
+  return new Promise((resolve) => {
+    let done = false;
+    const m = openModal(`<h2>${esc(title)}</h2><p class="sub">${text}</p>
+      ${days !== null ? `<div class="field"><label>Duração</label><select class="input" id="ac-days">${[1, 3, 7, 14, 30, 90, 365].filter((d) => d <= maxDays).map((d) => `<option value="${d}" ${d === days ? 'selected' : ''}>${d === 1 ? '1 dia' : `${d} dias`}</option>`).join('')}</select></div>` : ''}
+      ${reason ? `<div class="field"><label>${esc(reasonLabel)} <span class="hint">(obrigatório, fica no registro de ações)</span></label><textarea class="input ta" id="ac-reason" rows="3" maxlength="500"></textarea></div>` : ''}
+      ${typeWord ? `<div class="field"><label>Para confirmar, digite <b>${esc(typeWord)}</b></label><input class="input" id="ac-word" autocomplete="off"></div>` : ''}
+      <div class="error-text" id="ac-err"></div>
+      <div class="foot"><button class="btn ghost" id="ac-no">Cancelar</button><button class="btn ${danger ? 'danger' : 'primary'}" id="ac-ok">${esc(okLabel)}</button></div>`,
+    { onClose: () => { if (!done) resolve(null); } });
+    $('#ac-reason', m)?.focus();
+    $('#ac-no', m).onclick = () => closeModal();
+    $('#ac-ok', m).onclick = () => {
+      const r = $('#ac-reason', m)?.value.trim() || '';
+      if (reason && r.length < 3) return ($('#ac-err', m).textContent = 'Escreva o motivo (pelo menos 3 letras).');
+      if (typeWord && $('#ac-word', m).value.trim() !== typeWord) return ($('#ac-err', m).textContent = 'O texto digitado não confere.');
+      done = true; closeModal();
+      resolve({ reason: r, days: $('#ac-days', m) ? Number($('#ac-days', m).value) : undefined });
+    };
+  });
+}
+
+function renderAdmin(section = 'overview') {
+  if (!ADM_NAV.some((n) => n[0] === section)) section = 'overview';
+  const item = ADM_NAV.find((n) => n[0] === section);
+  if (item[3] > myRank()) section = 'overview';
+  S.admSection = section;
+  const [title, sub] = ADM_TITLES[section];
+  const counts = S.admCounts || {};
+  const badge = { reports: counts.reports, support: counts.support, users: counts.pending };
+  $('.announce')?.remove(); document.body.classList.remove('has-announce');
+  $('#app').innerHTML = `<div class="adm">
+    <aside class="adm-side">
+      <div class="adm-brand"><img src="/logo-192.png" alt=""><b>LUMIX</b><span>ADMIN</span></div>
+      <nav class="adm-nav">${ADM_NAV.filter((n) => n[3] <= myRank()).map(([k, l, ic]) => `<button data-sec="${k}" class="${k === section ? 'on' : ''}">${icon(ic)}<span>${l}</span>${badge[k] ? `<em>${badge[k]}</em>` : ''}</button>`).join('')}</nav>
+      <div class="adm-me">${avatarHtml(S.me)}<div><b>${esc(S.me.display_name)}</b><small>${RANK_NAME[myRank()]}</small></div>
+        <button class="icon-btn" id="adm-back" title="Voltar para a Lumix">${icon('door')}</button></div>
+    </aside>
+    <main class="adm-main">
+      <header class="adm-head"><div><h1>${title}</h1><p>${sub}</p></div>
+        <div class="adm-head-r"><button class="btn ghost" id="adm-back2">${icon('chat')}Voltar para a Lumix</button></div></header>
+      <div class="adm-body" id="adm-body"><div class="spinner"></div></div>
+    </main></div>`;
+  $$('[data-sec]').forEach((b) => { b.onclick = () => navigate(`/admin/${b.dataset.sec}`); });
+  $('#adm-back').onclick = $('#adm-back2').onclick = () => navigate('/');
+  const body = $('#adm-body');
+  ({ overview: admOverview, users: admUsers, communities: admCommunities, reports: admReports, updates: admUpdates,
+    support: admSupport, roles: admRoles, audit: admAudit, settings: admSettings })[section](body).catch?.(admErr);
+  admPing();
+}
+async function admPing() {
+  try {
+    const c = await api('/api/admin/ping');
+    S.admCounts = c; S.adminPending = c.pending + c.reports + c.support;
+    renderRail();
+    const map = { users: c.pending, reports: c.reports, support: c.support };
+    $$('.adm-nav [data-sec]').forEach((b) => { const n = map[b.dataset.sec]; let em = b.querySelector('em'); if (n) { if (!em) { em = document.createElement('em'); b.appendChild(em); } em.textContent = n; } else em?.remove(); });
+  } catch { /* sem acesso */ }
+}
+function renderAdminGate(kind) {
+  const body = $('#adm-body');
+  const html = `<div class="adm-gate">${icon('lock')}
+    <h2>${kind === 'setup' ? 'Ative a verificação em duas etapas' : 'Confirme que é você'}</h2>
+    <p>${kind === 'setup' ? 'Para proteger a Lumix, toda a equipe precisa usar a verificação em duas etapas (código do app autenticador) para abrir a área administrativa.'
+      : 'Esta sessão foi aberta sem o código de duas etapas. Saia e entre de novo digitando o código do app autenticador.'}</p>
+    ${kind === 'setup' ? `<button class="btn primary" id="gate-go">${icon('shield')}Ativar agora</button>` : `<button class="btn primary" id="gate-out">${icon('logout')}Sair e entrar de novo</button>`}</div>`;
+  if (body) body.innerHTML = html; else { renderAdmin('overview'); return; }
+  $('#gate-go')?.addEventListener('click', () => userSettings('security'));
+  $('#gate-out')?.addEventListener('click', () => logout());
+}
+
+// ---- visão geral
+async function admOverview(body) {
+  const o = await admApi('/api/admin/overview');
+  const st = o.stats;
+  const diff = st.new_week - st.new_prev_week;
+  const card = (ic, cls, label, n, foot) => `<div class="adm-card stat2"><span class="ic ${cls}">${icon(ic)}</span><div><small>${label}</small><b>${n.toLocaleString('pt-BR')}</b>${foot ? `<p>${foot}</p>` : ''}</div></div>`;
+  const max = Math.max(4, ...o.series.map((x) => x.count));
+  const W = 640, H = 200, px = (i) => 36 + i * ((W - 56) / 6), py = (v) => H - 24 - (v / max) * (H - 48);
+  const pts = o.series.map((x, i) => `${px(i)},${py(x.count)}`).join(' ');
+  const ticks = [0, Math.round(max / 2), max];
+  body.innerHTML = `
+    <div class="adm-grid4">
+      ${card('users', 'blue', 'Usuários', st.users, `${st.online} online agora`)}
+      ${card('userPlus', 'blue', 'Novos cadastros (7 dias)', st.new_week, `${diff >= 0 ? '▲' : '▼'} ${Math.abs(diff)} em relação à semana anterior · ${st.new_today} hoje`)}
+      ${card('block', 'red', 'Contas suspensas', st.suspended + st.banned, `${st.suspended} suspensas · ${st.banned} banidas`)}
+      ${card('folder', 'blue', 'Comunidades', st.communities, st.communities_suspended ? `${st.communities_suspended} suspensa(s)` : 'nenhuma suspensa')}
+      ${card('flag', 'red', 'Denúncias pendentes', st.reports_open, '')}
+      ${card('chat', 'blue', 'Suporte em aberto', st.support_open, '')}
+      ${card('mail', 'warn', 'Esperando liberação', st.pending, '')}
+      ${card('volume', 'blue', 'Em chamada agora', st.in_calls, '')}
+    </div>
+    <div class="adm-grid2">
+      <section class="adm-card"><h3>Novos cadastros</h3><p class="adm-sub">Total de novos usuários nos últimos 7 dias.</p>
+        <svg class="adm-chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
+          ${ticks.map((t) => `<line x1="36" x2="${W - 20}" y1="${py(t)}" y2="${py(t)}" /><text x="28" y="${py(t) + 4}" text-anchor="end">${t}</text>`).join('')}
+          <polygon points="${px(0)},${H - 24} ${pts} ${px(6)},${H - 24}" class="area" />
+          <polyline points="${pts}" class="line" />
+          ${o.series.map((x, i) => `<circle cx="${px(i)}" cy="${py(x.count)}" r="4"><title>${x.count} cadastro(s)</title></circle><text x="${px(i)}" y="${H - 6}" text-anchor="middle">${x.day.slice(8, 10)}/${x.day.slice(5, 7)}</text>`).join('')}
+        </svg></section>
+      <section class="adm-card"><h3>Ações rápidas</h3><p class="adm-sub">Atalhos para as principais ferramentas.</p>
+        <div class="quick">
+          ${myRank() >= 2 ? `<button data-q="updates"><span class="ic blue">${icon('megaphone')}</span><span><b>Publicar atualização</b><small>Comunique novidades para a comunidade.</small></span>${icon('chevron')}</button>` : ''}
+          <button data-q="reports"><span class="ic red">${icon('flag')}</span><span><b>Ver denúncias</b><small>${st.reports_open} esperando análise.</small></span>${icon('chevron')}</button>
+          <button data-q="users"><span class="ic blue">${icon('users')}</span><span><b>Gerenciar usuários</b><small>${st.pending ? `${st.pending} cadastro(s) esperando liberação.` : 'Pesquise, advirta ou suspenda contas.'}</small></span>${icon('chevron')}</button>
+        </div></section>
+    </div>
+    <div class="adm-grid2">
+      <section class="adm-card"><h3>Usuários recentes</h3><p class="adm-sub">Últimos cadastros na plataforma.</p>
+        ${admUserTable(o.recent_users, true)}</section>
+      <section class="adm-card"><h3>Últimas ações</h3><p class="adm-sub">Eventos recentes de moderação e administração.</p>
+        ${o.recent_actions.length ? `<div class="tl">${o.recent_actions.map(auditItem).join('')}</div><button class="link-btn" data-q="audit">Ver registro completo →</button>` : '<p class="hint">Nenhuma ação registrada ainda.</p>'}</section>
+    </div>
+    <section class="adm-card"><h3>Como a Lumix está ligada</h3>
+      <div class="sys">
+        <div class="${/Mongo/.test(o.storage) ? 'ok' : 'warn'}"><b>Dados</b><span>${esc(o.storage)}</span></div>
+        <div class="${o.mail_ready ? 'ok' : 'warn'}"><b>E-mail</b><span>${o.mail_ready ? 'Ligado — confirmação de cadastro e recuperação de senha por e-mail' : 'Desligado — recuperação de senha indisponível até ligar'}</span></div>
+        <div class="${o.ai === 'Assistente básico' ? 'warn' : 'ok'}"><b>IA dos servidores</b><span>${esc(o.ai)}</span></div>
+        <div class="${/Open Relay/.test(o.turn) ? 'warn' : 'ok'}"><b>Chamadas (TURN)</b><span>${esc(o.turn)}${/Open Relay/.test(o.turn) ? ' — pode ter atraso para quem está longe' : ''}</span></div>
+      </div></section>`;
+  $$('[data-q]', body).forEach((b) => { b.onclick = () => navigate(`/admin/${b.dataset.q}`); });
+  bindUserTable(body, o.recent_users, () => admOverview(body));
+}
+function auditItem(a) {
+  return `<div class="tl-i"><span class="ic ${/Ban|Susp|Apag|Exclu|Recus|Advert/.test(a.action) ? 'red' : 'blue'}">${icon(/Ban|Susp|Advert/.test(a.action) ? 'flag' : 'shield')}</span>
+    <div><b>${esc(a.actor_name)}</b> <span class="rtag">${esc(a.actor_role)}</span> ${esc(a.action.charAt(0).toLowerCase() + a.action.slice(1))}${a.target_label ? `: <b>${esc(a.target_label)}</b>` : ''}
+    ${a.reason ? `<small>Motivo: ${esc(a.reason)}</small>` : ''}${a.details ? `<small>${esc(a.details)}</small>` : ''}</div><time>${admRel(a.at)}</time></div>`;
+}
+
+// ---- usuários
+function admUserTable(list, compact) {
+  if (!list.length) return '<p class="hint">Ninguém encontrado.</p>';
+  return `<div class="adm-table ${compact ? 'compact' : ''}"><div class="tr th"><span>Usuário</span><span>Cargo</span><span>Estado</span>${compact ? '' : '<span>E-mail</span>'}<span>Cadastro</span><span></span></div>
+    ${list.map((u) => `<div class="tr" data-uid="${u.id}">
+      <span class="who">${avatarHtml(u)}<span><b>${esc(u.display_name)}</b><small>@${esc(u.username)}${compact ? '' : ` · ${esc(u.email)}`}</small></span></span>
+      <span>${roleChip(u.staff_role)}</span><span>${stateChip(u.restriction)}${u.warnings ? ` <span class="chip warn" title="Advertências">⚠ ${u.warnings}</span>` : ''}</span>
+      ${compact ? '' : `<span>${emailChip(u.email_state)}</span>`}
+      <span class="muted">${admRel(u.created_at)}</span>
+      <span><button class="icon-btn" data-umenu="${u.id}" title="Ações">${icon('more')}</button></span></div>`).join('')}</div>`;
+}
+function bindUserTable(root, list, reload) {
+  $$('[data-uid]', root).forEach((row) => { row.onclick = (e) => { if (!e.target.closest('[data-umenu]')) admUserDetail(row.dataset.uid, reload); }; });
+  $$('[data-umenu]', root).forEach((b) => { b.onclick = (e) => { e.stopPropagation(); admUserMenu(b, list.find((x) => x.id === b.dataset.umenu), reload); }; });
+}
+function admUserMenu(anchor, u, reload) {
+  const r = myRank(), above = u.rank >= r || u.id === S.me.id;
+  const st = u.restriction?.state;
+  const items = [['Ver detalhes', 'users', () => admUserDetail(u.id, reload)]];
+  if (st === 'pendente') {
+    items.push(['Liberar cadastro', 'check', () => admApproveUser(u, reload)]);
+    if (r >= 2) items.push(['Recusar cadastro', 'trash', () => admDeleteUser(u, reload, true), true]);
+  } else if (!above) {
+    items.push(['Advertir', 'flag', () => admModerate(u, 'warn', reload)]);
+    if (st === 'ativo') items.push(['Suspender', 'block', () => admModerate(u, 'suspend', reload), true]);
+    if (st !== 'banido' && r >= 2) items.push(['Banir', 'block', () => admModerate(u, 'ban', reload), true]);
+    if (st === 'suspenso' || (st === 'banido' && r >= 2)) items.push(['Reativar conta', 'check', () => admModerate(u, 'reactivate', reload)]);
+    if (r >= 2 && st === 'ativo') items.push(['Mudar cargo', 'shield', () => admRoleDialog(u, reload)]);
+    if (r >= 3) items.push(['Excluir conta', 'trash', () => admDeleteUser(u, reload, false), true]);
+  }
+  popMenu(anchor, items);
+}
+async function admApproveUser(u, reload) {
+  try { await admApi(`/api/admin/users/${u.id}/approve`, { method: 'POST' }); toast(`Cadastro de ${u.display_name} liberado.`); reload?.(); admPing(); } catch (e) { admErr(e); }
+}
+async function admModerate(u, action, reload) {
+  const cfg = {
+    warn: { title: `Advertir ${u.display_name}`, text: 'A pessoa recebe um aviso com o motivo na próxima vez que abrir a Lumix.', danger: false, okLabel: 'Enviar advertência' },
+    suspend: { title: `Suspender ${u.display_name}`, text: 'A pessoa é desconectada e não consegue entrar até o fim do prazo.', days: 3, maxDays: myRank() >= 2 ? 365 : 7, okLabel: 'Suspender' },
+    ban: { title: `Banir ${u.display_name}`, text: 'A conta fica bloqueada por tempo indeterminado. A pessoa é desconectada na hora.', okLabel: 'Banir', typeWord: u.username },
+    reactivate: { title: `Reativar ${u.display_name}`, text: 'Tira a suspensão ou o banimento. A pessoa volta a conseguir entrar.', danger: false, okLabel: 'Reativar' },
+  }[action];
+  const ok = await admConfirm(cfg); if (!ok) return;
+  try {
+    await admApi(`/api/admin/users/${u.id}/moderate`, { method: 'POST', body: { action, reason: ok.reason, days: ok.days } });
+    toast({ warn: 'Advertência enviada.', suspend: 'Conta suspensa.', ban: 'Conta banida.', reactivate: 'Conta reativada.' }[action]);
+    reload?.();
+  } catch (e) { admErr(e); }
+}
+async function admDeleteUser(u, reload, pending) {
+  const ok = await admConfirm({ title: pending ? `Recusar cadastro de ${u.display_name}` : `Excluir a conta de ${u.display_name}`,
+    text: pending ? 'A conta que estava esperando é apagada.' : 'Apaga a conta para sempre, junto com as comunidades que ela criou. Não dá para desfazer.',
+    okLabel: pending ? 'Recusar' : 'Excluir para sempre', typeWord: pending ? '' : u.username });
+  if (!ok) return;
+  try { await admApi(`/api/admin/users/${u.id}`, { method: 'DELETE', body: { reason: ok.reason } }); toast(pending ? 'Cadastro recusado.' : 'Conta excluída.'); reload?.(); admPing(); return 'gone'; } catch (e) { admErr(e); }
+}
+async function admRoleDialog(u, reload) {
+  const r = myRank();
+  const opts = [['member', 'Membro', 'Sem acesso à área administrativa.'], ['mod', 'Moderador', 'Analisa denúncias e suporte; pode advertir e suspender por até 7 dias.'],
+    ...(r >= 3 ? [['admin', 'Administrador', 'Tudo do moderador + banir, suspender comunidades, publicar atualizações e mudar configurações.']] : [])];
+  const cur = u.rank === 2 ? 'admin' : u.rank === 1 ? 'mod' : 'member';
+  const m = openModal(`<h2>Cargo de ${esc(u.display_name)}</h2><p class="sub">${r >= 3 ? 'Como Dono, você pode promover administradores.' : 'Só o Dono pode promover administradores.'}</p>
+    <div class="reasons">${opts.map(([v, l, d]) => `<label class="reason"><input type="radio" name="rl" value="${v}" ${v === cur ? 'checked' : ''}><span><b>${l}</b><br><small class="hint">${d}</small></span></label>`).join('')}</div>
+    <p class="hint">Quem entra na equipe precisa ativar a verificação em duas etapas para abrir o painel.</p>
+    <div class="field"><label>Motivo (opcional)</label><input class="input" id="rl-reason" maxlength="300"></div>
+    <div class="error-text" id="rl-err"></div>
+    <div class="foot"><button class="btn ghost" id="rl-no">Cancelar</button><button class="btn primary" id="rl-ok">Salvar cargo</button></div>`);
+  $('#rl-no', m).onclick = closeModal;
+  $('#rl-ok', m).onclick = async () => {
+    const role = $('[name=rl]:checked', m).value;
+    if (role === cur) return closeModal();
+    try { await admApi(`/api/admin/users/${u.id}/role`, { method: 'POST', body: { role, reason: $('#rl-reason', m).value } }); closeModal(); toast('Cargo atualizado.'); reload?.(); }
+    catch (e) { if (!e.silent) $('#rl-err', m).textContent = e.message; }
+  };
+}
+async function admUserDetail(uid, reload) {
+  let u;
+  try { u = await admApi(`/api/admin/users/${uid}`); } catch (e) { return admErr(e); }
+  const again = () => { closeModal(); reload?.(); admUserDetail(uid, reload); };
+  const m = openModal(`<div class="adm-detail">
+    <div class="who big">${avatarHtml(u)}<span><b>${esc(u.display_name)}</b><small>@${esc(u.username)}</small></span><span class="spacer"></span>${roleChip(u.staff_role)}</div>
+    <div class="kv">
+      <span>ID</span><code>${esc(u.id)}</code>
+      <span>E-mail</span><span>${esc(u.email)} ${emailChip(u.email_state)}</span>
+      <span>Estado</span><span>${stateChip(u.restriction)}${u.restriction.until ? ` até ${admWhen(u.restriction.until, true)}` : ''}${u.restriction.reason ? `<small class="hint" style="display:block">Motivo: ${esc(u.restriction.reason)}</small>` : ''}</span>
+      <span>Cadastro</span><span>${admWhen(u.created_at, true)}</span>
+      <span>Último acesso</span><span>${admWhen(u.last_seen, true)} · ${u.sessions} sessão(ões) ativa(s)</span>
+      <span>Duas etapas</span><span>${u.two_factor ? 'Ligada' : 'Desligada'}</span>
+      <span>Comunidades</span><span>participa de ${u.servers}${u.owned_servers.length ? ` · dona de ${u.owned_servers.map((s) => esc(s.name)).join(', ')}` : ''}</span>
+      <span>Denúncias</span><span>${u.reports_against} contra · ${u.reports_sent} enviadas</span>
+    </div>
+    ${u.warnings_list.length ? `<h4 class="perm-title">Advertências (${u.warnings_list.length})</h4>${u.warnings_list.map((w) => `<div class="mini-row"><b>${admRel(w.at)}</b> por ${esc(w.by_name)} — ${esc(w.reason)}</div>`).join('')}` : ''}
+    <h4 class="perm-title">Histórico da conta</h4>
+    ${u.history.length ? `<div class="tl">${u.history.map(auditItem).join('')}</div>` : '<p class="hint">Nenhuma ação da equipe nesta conta.</p>'}
+    <p class="hint">Senhas, códigos e tokens nunca aparecem aqui.</p>
+    <div class="foot" id="ud-actions"></div></div>`, { big: true });
+  const acts = $('#ud-actions', m);
+  const r = myRank(), st = u.restriction.state, above = u.rank >= r || u.id === S.me.id;
+  const btn = (label, cls, fn) => { const b = document.createElement('button'); b.className = `btn ${cls}`; b.textContent = label; b.onclick = async () => { closeModal(); if ((await fn()) !== 'gone') admUserDetail(uid, reload); }; acts.appendChild(b); };
+  if (st === 'pendente') { btn('Liberar cadastro', 'primary', () => admApproveUser(u, reload)); if (r >= 2) btn('Recusar', 'danger', () => admDeleteUser(u, reload, true)); }
+  else if (!above) {
+    btn('Advertir', 'ghost', () => admModerate(u, 'warn', reload));
+    if (st === 'ativo') btn('Suspender', 'danger', () => admModerate(u, 'suspend', reload));
+    if (st !== 'banido' && r >= 2) btn('Banir', 'danger', () => admModerate(u, 'ban', reload));
+    if (st === 'suspenso' || (st === 'banido' && r >= 2)) btn('Reativar', 'primary', () => admModerate(u, 'reactivate', reload));
+    if (r >= 2 && st === 'ativo') btn('Mudar cargo', 'ghost', () => admRoleDialog(u, reload));
+  } else acts.innerHTML = `<span class="hint">${u.id === S.me.id ? 'Esta é a sua conta.' : 'Você não pode agir sobre alguém do mesmo cargo ou acima.'}</span>`;
+  void again;
+}
+async function admUsers(body) {
+  const f = S.admUserFilter ?? '';
+  body.innerHTML = `<section class="adm-card">
+    <div class="adm-tools"><div class="adm-search">${icon('compass')}<input class="input" id="au-q" placeholder="Pesquisar por nome, @usuário, ID ou e-mail" value="${esc(S.admUserQ || '')}"></div>
+      <div class="seg">${[['', 'Todos'], ['pending', 'Esperando'], ['suspended', 'Suspensos'], ['banned', 'Banidos'], ['warned', 'Advertidos'], ['staff', 'Equipe']].map(([k, l]) => `<button data-f="${k}" class="${k === f ? 'on' : ''}">${l}</button>`).join('')}</div></div>
+    <div id="au-list"><div class="spinner"></div></div></section>`;
+  let page = 1;
+  const load = async (p = page) => {
+    page = p;
+    try {
+      const pg = await admApi(`/api/admin/users?q=${encodeURIComponent(S.admUserQ || '')}&filter=${f}&page=${page}`);
+      const box = $('#au-list', body); if (!box) return;
+      box.innerHTML = admUserTable(pg.items, false) + admPager(pg, load);
+      bindUserTable(box, pg.items, () => { load(); admPing(); }); bindPager(box, load);
+    } catch (e) { admErr(e); }
+  };
+  let t; $('#au-q', body).oninput = (e) => { S.admUserQ = e.target.value; clearTimeout(t); t = setTimeout(() => load(1), 250); };
+  $$('[data-f]', body).forEach((b) => { b.onclick = () => { S.admUserFilter = b.dataset.f; admUsers(body); }; });
+  load();
+}
+
+// ---- comunidades
+async function admCommunities(body) {
+  const f = S.admComFilter || '';
+  body.innerHTML = `<section class="adm-card">
+    <div class="adm-tools"><div class="adm-search">${icon('compass')}<input class="input" id="ac-q" placeholder="Pesquisar por nome, ID ou @dono"></div>
+      <div class="seg">${[['', 'Todas'], ['reported', 'Com denúncias'], ['suspended', 'Suspensas']].map(([k, l]) => `<button data-f="${k}" class="${k === f ? 'on' : ''}">${l}</button>`).join('')}</div></div>
+    <div id="ac-list"><div class="spinner"></div></div></section>`;
+  let page = 1, q = '';
+  const load = async (p = page) => {
+    page = p;
+    try {
+      const pg = await admApi(`/api/admin/communities?q=${encodeURIComponent(q)}&filter=${f}&page=${page}`);
+      const box = $('#ac-list', body); if (!box) return;
+      box.innerHTML = pg.items.length ? `<div class="adm-table com"><div class="tr th"><span>Comunidade</span><span>Responsável</span><span>Membros</span><span>Canais</span><span>Estado</span><span></span></div>
+        ${pg.items.map((s) => `<div class="tr" data-sid="${s.id}"><span class="who">${serverIconHtml(s, 'server-icon sm')}<span><b>${esc(s.name)}</b><small>criada ${admRel(s.created_at)}</small></span></span>
+          <span>${s.owner ? `${esc(s.owner.display_name)} <small class="muted">@${esc(s.owner.username)}</small>` : '—'}</span><span>${s.members}</span><span>${s.channels}</span>
+          <span>${s.suspended ? '<span class="chip bad"><i></i>Suspensa</span>' : '<span class="chip ok"><i></i>Ativa</span>'}${s.reports ? ` <span class="chip warn">⚑ ${s.reports}</span>` : ''}</span>
+          <span>${icon('chevron')}</span></div>`).join('')}</div>${admPager(pg, load)}` : '<p class="hint">Nenhuma comunidade encontrada.</p>';
+      $$('[data-sid]', box).forEach((row) => { row.onclick = () => admCommunityDetail(row.dataset.sid, load); });
+      bindPager(box, load);
+    } catch (e) { admErr(e); }
+  };
+  let t; $('#ac-q', body).oninput = (e) => { q = e.target.value; clearTimeout(t); t = setTimeout(() => load(1), 250); };
+  $$('[data-f]', body).forEach((b) => { b.onclick = () => { S.admComFilter = b.dataset.f; admCommunities(body); }; });
+  load();
+}
+async function admCommunityDetail(sid, reload) {
+  let s;
+  try { s = await admApi(`/api/admin/communities/${sid}`); } catch (e) { return admErr(e); }
+  const kindIc = { text: 'hash', voice: 'volume' };
+  const m = openModal(`<div class="adm-detail">
+    <div class="who big">${serverIconHtml(s, 'server-icon')}<span><b>${esc(s.name)}</b><small>${s.members} membros · ${s.channels} canais · criada ${admWhen(s.created_at, true)}</small></span><span class="spacer"></span>
+      ${s.suspended ? '<span class="chip bad"><i></i>Suspensa</span>' : '<span class="chip ok"><i></i>Ativa</span>'}</div>
+    ${s.suspended ? `<p class="adm-alert">Suspensa. Motivo: ${esc(s.suspend_reason)}</p>` : ''}
+    <div class="kv"><span>ID</span><code>${esc(s.id)}</code><span>Responsável</span><span>${s.owner ? `${esc(s.owner.display_name)} (@${esc(s.owner.username)})` : '—'}</span>
+      <span>Administração</span><span>${s.staff.map((p) => esc(p.display_name)).join(', ') || '—'}</span>
+      <span>Cargos</span><span>${s.roles.map((r) => `<span class="rchip" style="${r.color ? `color:${esc(r.color)}` : ''}">${esc(r.name)}</span>`).join(' ') || '—'}</span></div>
+    <h4 class="perm-title">Canais <span class="hint">(só a estrutura — as conversas não ficam abertas para a equipe)</span></h4>
+    <div class="chan-list">${s.channel_list.map((c) => `<div>${icon(kindIc[c.kind] || 'hash')}<b>${esc(c.name)}</b><small>${esc(c.category)}${c.private ? ' · privado' : ''}${c.read_only ? ' · só leitura' : ''}${c.messages !== undefined ? ` · ${c.messages} msgs` : ''}</small></div>`).join('') || '<p class="hint">Sem canais.</p>'}</div>
+    <h4 class="perm-title">Denúncias ligadas a esta comunidade (${s.reports_list.length})</h4>
+    ${s.reports_list.length ? s.reports_list.map((r) => `<div class="mini-row clickable" data-rid="${r.id}"><b>${esc(r.reason || r.type)}</b> — ${admRel(r.created_at)} · ${esc(REPORT_STATE[r.status]?.[0] || r.status)}</div>`).join('') : '<p class="hint">Nenhuma.</p>'}
+    <h4 class="perm-title">Histórico</h4>${s.history.length ? `<div class="tl">${s.history.map(auditItem).join('')}</div>` : '<p class="hint">Nenhuma ação da equipe.</p>'}
+    <div class="foot">${myRank() >= 2 ? `<button class="btn ${s.suspended ? 'primary' : 'danger'}" id="cm-sus">${s.suspended ? 'Reativar comunidade' : 'Suspender comunidade'}</button>` : '<span class="hint">Só administradores podem suspender comunidades.</span>'}</div></div>`, { big: true });
+  $$('[data-rid]', m).forEach((b) => { b.onclick = () => { closeModal(); admReportDetail(b.dataset.rid, reload); }; });
+  $('#cm-sus', m)?.addEventListener('click', async () => {
+    closeModal();
+    const ok = await admConfirm({ title: s.suspended ? `Reativar ${s.name}` : `Suspender ${s.name}`, danger: !s.suspended, okLabel: s.suspended ? 'Reativar' : 'Suspender',
+      text: s.suspended ? 'Os membros voltam a acessar os canais.' : 'Ninguém consegue abrir os canais nem entrar nas salas de voz até a equipe reativar. Quem estiver em chamada é desconectado.' });
+    if (!ok) return;
+    try { await admApi(`/api/admin/communities/${s.id}/suspend`, { method: 'POST', body: { suspended: !s.suspended, reason: ok.reason } }); toast(s.suspended ? 'Comunidade reativada.' : 'Comunidade suspensa.'); reload?.(); admCommunityDetail(sid, reload); }
+    catch (e) { admErr(e); }
+  });
+}
+
+// ---- denúncias
+const REPORT_STATE = { aberta: ['Pendente', 'warn'], analise: ['Em análise', 'blue'], resolvida: ['Resolvida', 'ok'], arquivada: ['Arquivada', ''] };
+const REPORT_TYPE = { message: 'Mensagem', user: 'Perfil', server: 'Comunidade', bug: 'Problema técnico' };
+async function admReports(body) {
+  const st = S.admRepState || 'pendentes';
+  body.innerHTML = `<section class="adm-card"><div class="adm-tools">
+      <div class="seg">${[['pendentes', 'Fila'], ['aberta', 'Pendentes'], ['analise', 'Em análise'], ['resolvida', 'Resolvidas'], ['arquivada', 'Arquivadas'], ['todas', 'Todas']].map(([k, l]) => `<button data-s="${k}" class="${k === st ? 'on' : ''}">${l}</button>`).join('')}</div>
+      <select class="input" id="ar-type" style="max-width:200px"><option value="">Todos os tipos</option>${Object.entries(REPORT_TYPE).map(([k, l]) => `<option value="${k}" ${S.admRepType === k ? 'selected' : ''}>${l}</option>`).join('')}</select></div>
+    <div id="ar-list"><div class="spinner"></div></div></section>`;
+  let page = 1;
+  const load = async (p = page) => {
+    page = p;
+    try {
+      const pg = await admApi(`/api/admin/reports?status=${st}&type=${S.admRepType || ''}&page=${page}`);
+      const box = $('#ar-list', body); if (!box) return;
+      box.innerHTML = pg.items.length ? `<div class="adm-table rep"><div class="tr th"><span>Motivo</span><span>Conteúdo denunciado</span><span>Data</span><span>Andamento</span><span></span></div>
+        ${pg.items.map((r) => `<div class="tr" data-rid="${r.id}"><span><span class="rtag">${REPORT_TYPE[r.type]}</span> <b>${esc(r.reason || '—')}</b></span>
+          <span class="clip">${r.snapshot ? esc(r.snapshot.content || '(anexo)') : r.target_person ? `Perfil de ${esc(r.target_person.display_name)}` : r.target_server ? esc(r.target_server.name) : esc(r.details || '')}</span>
+          <span class="muted">${admRel(r.created_at)}</span><span><span class="chip ${REPORT_STATE[r.status]?.[1]}"><i></i>${REPORT_STATE[r.status]?.[0] || r.status}</span></span><span>${icon('chevron')}</span></div>`).join('')}</div>${admPager(pg, load)}`
+        : '<p class="hint">Nada aqui. 🎉</p>';
+      $$('[data-rid]', box).forEach((row) => { row.onclick = () => admReportDetail(row.dataset.rid, () => { load(); admPing(); }); });
+      bindPager(box, load);
+    } catch (e) { admErr(e); }
+  };
+  $$('[data-s]', body).forEach((b) => { b.onclick = () => { S.admRepState = b.dataset.s; admReports(body); }; });
+  $('#ar-type', body).onchange = (e) => { S.admRepType = e.target.value; load(1); };
+  load();
+}
+async function admReportDetail(rid, reload) {
+  let r;
+  try { r = await admApi(`/api/admin/reports/${rid}`); } catch (e) { return admErr(e); }
+  const tp = r.target_person;
+  const canPunish = tp && tp.rank < myRank() && tp.id !== S.me.id;
+  const m = openModal(`<div class="adm-detail">
+    <div class="report-top"><span class="rtag">${REPORT_TYPE[r.type]}</span><b>${esc(r.reason || '—')}</b><span class="spacer"></span><span class="chip ${REPORT_STATE[r.status]?.[1]}"><i></i>${REPORT_STATE[r.status]?.[0]}</span></div>
+    <div class="kv"><span>Enviada</span><span>${admWhen(r.created_at, true)} por ${esc(r.reporter_user?.display_name || '?')} (@${esc(r.reporter_user?.username || '')})</span>
+      ${tp ? `<span>Denunciado</span><span>${esc(tp.display_name)} (@${esc(tp.username)}) ${stateChip(tp.restriction)}</span>` : ''}
+      ${r.target_server ? `<span>Comunidade</span><span>${esc(r.target_server.name)} ${r.target_server.suspended ? '<span class="chip bad"><i></i>Suspensa</span>' : ''}</span>` : ''}
+      ${r.where ? `<span>Onde</span><span>${esc(r.where)}</span>` : ''}</div>
+    ${r.details ? `<h4 class="perm-title">Detalhes de quem denunciou</h4><p>${esc(r.details)}</p>` : ''}
+    ${r.snapshot ? `<h4 class="perm-title">Conteúdo denunciado ${r.message_gone ? '<span class="hint">(a mensagem já foi apagada)</span>' : ''}</h4>
+      ${r.context ? `<div class="ctx">${r.context.map((c) => `<div class="${c.target ? 'hit' : ''}"><b>${esc(c.author)}</b> <small>${admRel(c.at)}</small><p>${esc(c.content) || '<i>(anexo)</i>'}</p></div>`).join('')}</div>`
+      : `<blockquote>${esc(r.snapshot.content || '')}${r.snapshot.attachments?.length ? ` <i>(+${r.snapshot.attachments.length} anexo)</i>` : ''}</blockquote>`}
+      ${r.private_note ? `<p class="hint">🔒 ${esc(r.private_note)}</p>` : ''}` : ''}
+    ${r.page ? `<p class="hint">${esc(r.page)}</p>` : ''}
+    ${r.history?.length ? `<h4 class="perm-title">Andamento</h4><div class="tl">${r.history.map(auditItem).join('')}</div>` : ''}
+    <div class="foot wrap" id="rp-actions"></div></div>`, { big: true });
+  const acts = $('#rp-actions', m);
+  const add = (label, cls, fn) => { const b = document.createElement('button'); b.className = `btn ${cls}`; b.textContent = label; b.onclick = fn; acts.appendChild(b); };
+  const status = async (s, needNote) => {
+    let note = '';
+    if (needNote) { closeModal(); const ok = await admConfirm({ title: 'Arquivar denúncia', text: 'Arquivar quando não há violação ou a denúncia é repetida.', danger: false, okLabel: 'Arquivar' }); if (!ok) return; note = ok.reason; }
+    try { await admApi(`/api/admin/reports/${r.id}`, { method: 'PATCH', body: { status: s, note } }); closeModal(); reload?.(); admReportDetail(r.id, reload); } catch (e) { admErr(e); }
+  };
+  const act = async (action, cfg) => {
+    closeModal();
+    const ok = await admConfirm(cfg); if (!ok) return admReportDetail(r.id, reload);
+    try { const res = await admApi(`/api/admin/reports/${r.id}/action`, { method: 'POST', body: { action, reason: ok.reason, days: ok.days } }); toast(res.message); reload?.(); admReportDetail(r.id, reload); }
+    catch (e) { admErr(e); }
+  };
+  if (r.status === 'aberta') add('Analisar', 'primary', () => status('analise'));
+  if (['aberta', 'analise'].includes(r.status)) {
+    if (r.type === 'message' && !r.message_gone) add('Apagar mensagem', 'danger', () => act('delete_message', { title: 'Apagar a mensagem denunciada', text: 'A mensagem some para todo mundo.', okLabel: 'Apagar' }));
+    if (canPunish) {
+      add('Advertir', 'ghost', () => act('warn', { title: `Advertir ${tp.display_name}`, text: 'A pessoa recebe um aviso com o motivo.', danger: false, okLabel: 'Advertir' }));
+      if (tp.restriction.state === 'ativo') add('Suspender', 'danger', () => act('suspend', { title: `Suspender ${tp.display_name}`, text: 'A pessoa é desconectada até o fim do prazo.', days: 3, maxDays: myRank() >= 2 ? 365 : 7, okLabel: 'Suspender' }));
+      if (myRank() >= 2 && tp.restriction.state !== 'banido') add('Banir', 'danger', () => act('ban', { title: `Banir ${tp.display_name}`, text: 'Bloqueia a conta por tempo indeterminado.', okLabel: 'Banir', typeWord: tp.username }));
+    }
+    if (r.target_server && !r.target_server.suspended && myRank() >= 2) add('Suspender comunidade', 'danger', () => act('suspend_server', { title: `Suspender ${r.target_server.name}`, text: 'Ninguém consegue abrir os canais até a equipe reativar.', okLabel: 'Suspender' }));
+    add('Resolvida sem ação', 'ghost', () => status('resolvida'));
+    add('Arquivar', 'ghost', () => status('arquivada', true));
+  } else add('Reabrir', 'ghost', () => status('aberta'));
+  if (tp) add('Ver conta', 'ghost', () => { closeModal(); admUserDetail(tp.id, reload); });
+}
+
+// ---- atualizações
+const UPD_KIND = { novidade: ['Novidade', 'blue'], correcao: ['Correção', 'ok'], aviso: ['Aviso', 'warn'] };
+function updateCardHtml(x) {
+  return `<article class="upd ${x.pinned ? 'pinned' : ''}">
+    <div class="upd-top"><span class="chip ${UPD_KIND[x.kind]?.[1]}"><i></i>${UPD_KIND[x.kind]?.[0]}</span>${x.version ? `<span class="rtag">v${esc(x.version)}</span>` : ''}${x.pinned ? '<span class="rtag">📌 Fixada</span>' : ''}<span class="spacer"></span><time>${admRel(x.created_at)}</time></div>
+    <h3>${esc(x.title)}</h3>${x.image_url ? `<img src="${esc(x.image_url)}" alt="">` : ''}<div class="upd-text">${linkify(esc(x.text)).replace(/\n/g, '<br>')}</div>
+    <small class="muted">por ${esc(x.author_name)}${x.edited_at ? ' · editada' : ''}</small></article>`;
+}
+async function admUpdates(body, editing) {
+  const list = await admApi('/api/updates');
+  const e = editing || { kind: 'novidade', title: '', version: '', text: '', image_url: '', pinned: false };
+  body.innerHTML = `<div class="adm-grid2 upd-grid">
+    <section class="adm-card"><h3>${e.id ? 'Editar atualização' : 'Nova atualização'}</h3><p class="adm-sub">Aparece em <b>Novidades da Lumix</b> para todo mundo.</p>
+      <div class="seg" id="up-kind">${Object.entries(UPD_KIND).map(([k, [l]]) => `<button data-k="${k}" class="${e.kind === k ? 'on' : ''}">${l}</button>`).join('')}</div>
+      <div class="row2"><div class="field"><label>Título</label><input class="input" id="up-title" maxlength="100" value="${esc(e.title)}"></div>
+        <div class="field" style="max-width:130px"><label>Versão</label><input class="input" id="up-ver" maxlength="20" placeholder="1.2.0" value="${esc(e.version)}"></div></div>
+      <div class="field"><label>Texto</label><textarea class="input ta" id="up-text" rows="7" maxlength="5000">${esc(e.text)}</textarea></div>
+      <div class="field"><label>Imagem (opcional)</label><div class="row"><button class="btn ghost" id="up-img">${icon('image')}${e.image_url ? 'Trocar imagem' : 'Escolher imagem'}</button>${e.image_url ? '<button class="btn ghost" id="up-img-rm">Tirar</button>' : ''}</div></div>
+      <div class="switch"><span>Fixar no topo</span><input type="checkbox" id="up-pin" ${e.pinned ? 'checked' : ''}></div>
+      <div class="error-text" id="up-err"></div>
+      <div class="row">${e.id ? '<button class="btn ghost" id="up-cancel">Cancelar edição</button>' : ''}<button class="btn primary" id="up-pub">${icon('send')}${e.id ? 'Salvar alterações' : 'Publicar'}</button></div></section>
+    <section class="adm-card"><h3>Prévia</h3><p class="adm-sub">Assim a atualização vai aparecer.</p><div id="up-prev"></div></section></div>
+    <section class="adm-card"><h3>Publicadas (${list.length})</h3>
+      ${list.length ? list.map((x) => `<div class="mini-row upd-row"><span class="chip ${UPD_KIND[x.kind]?.[1]}"><i></i>${UPD_KIND[x.kind]?.[0]}</span>${x.pinned ? '📌' : ''}<b>${esc(x.title)}</b>${x.version ? `<span class="rtag">v${esc(x.version)}</span>` : ''}<span class="spacer"></span><small class="muted">${admRel(x.created_at)}</small>
+        <button class="btn ghost sm" data-ed="${x.id}">Editar</button><button class="btn ghost sm" data-rm="${x.id}">Remover</button></div>`).join('') : '<p class="hint">Nada publicado ainda.</p>'}</section>`;
+  const read = () => ({ ...e, kind: $('#up-kind .on', body).dataset.k, title: $('#up-title', body).value, version: $('#up-ver', body).value, text: $('#up-text', body).value, pinned: $('#up-pin', body).checked, created_at: e.created_at || new Date().toISOString(), author_name: e.author_name || S.me.display_name });
+  const prev = () => { const d = read(); $('#up-prev', body).innerHTML = d.title || d.text ? updateCardHtml({ ...d, title: d.title || 'Título', text: d.text || '' }) : '<p class="hint">Comece a escrever para ver a prévia.</p>'; };
+  $$('input, textarea', body).forEach((x) => x.addEventListener('input', prev));
+  $('#up-pin', body).onchange = prev;
+  $$('#up-kind [data-k]', body).forEach((b) => { b.onclick = () => { $$('#up-kind button', body).forEach((x) => x.classList.toggle('on', x === b)); prev(); }; });
+  $('#up-img', body).onclick = async () => { const u = await pickImage(1280); if (u) { Object.assign(e, read(), { image_url: u }); admUpdates(body, e); } };
+  $('#up-img-rm', body)?.addEventListener('click', () => { Object.assign(e, read(), { image_url: '' }); admUpdates(body, e); });
+  $('#up-cancel', body)?.addEventListener('click', () => admUpdates(body));
+  $('#up-pub', body).onclick = async (ev) => {
+    const d = read();
+    if (!e.id && !(await admConfirm({ title: 'Publicar atualização?', text: 'Todo mundo vai ver em Novidades da Lumix e receber um aviso.', reason: false, danger: false, okLabel: 'Publicar' }))) return;
+    ev.target.disabled = true;
+    try {
+      const payload = { kind: d.kind, title: d.title, version: d.version, text: d.text, image_url: d.image_url, pinned: d.pinned };
+      await admApi(e.id ? `/api/admin/updates/${e.id}` : '/api/admin/updates', { method: e.id ? 'PATCH' : 'POST', body: payload });
+      toast(e.id ? 'Atualização salva.' : 'Atualização publicada!'); admUpdates(body);
+    } catch (err) { if (!err.silent) $('#up-err', body).textContent = err.message; ev.target.disabled = false; }
+  };
+  $$('[data-ed]', body).forEach((b) => { b.onclick = () => { admUpdates(body, { ...list.find((x) => x.id === b.dataset.ed) }); body.scrollIntoView(); }; });
+  $$('[data-rm]', body).forEach((b) => { b.onclick = async () => {
+    const x = list.find((y) => y.id === b.dataset.rm);
+    const ok = await admConfirm({ title: `Remover "${x.title}"`, text: 'A atualização some das Novidades. A remoção fica no registro de ações.', okLabel: 'Remover' });
+    if (!ok) return;
+    try { await admApi(`/api/admin/updates/${x.id}`, { method: 'DELETE', body: { reason: ok.reason } }); toast('Removida.'); admUpdates(body); } catch (err) { admErr(err); }
+  }; });
+  prev();
+}
+
+// ---- suporte
+const TICKET_STATE = { aberto: ['Aberto', 'warn'], atendimento: ['Em atendimento', 'blue'], resolvido: ['Resolvido', 'ok'] };
+const ticketChip = (s) => `<span class="chip ${TICKET_STATE[s]?.[1]}"><i></i>${TICKET_STATE[s]?.[0] || s}</span>`;
+async function admSupport(body) {
+  const st = S.admSupState ?? 'aberto';
+  body.innerHTML = `<section class="adm-card"><div class="adm-tools"><div class="seg" id="as-seg"></div></div><div id="as-list"><div class="spinner"></div></div></section>`;
+  let page = 1;
+  const load = async (p = page) => {
+    page = p;
+    try {
+      const pg = await admApi(`/api/admin/support?status=${st}&page=${page}`);
+      $('#as-seg', body).innerHTML = [['aberto', 'Abertos'], ['atendimento', 'Em atendimento'], ['resolvido', 'Resolvidos'], ['', 'Todos']].map(([k, l]) => `<button data-s="${k}" class="${k === st ? 'on' : ''}">${l}${k && pg.counts[k] ? ` <em>${pg.counts[k]}</em>` : ''}</button>`).join('');
+      $$('[data-s]', body).forEach((b) => { b.onclick = () => { S.admSupState = b.dataset.s; admSupport(body); }; });
+      const box = $('#as-list', body); if (!box) return;
+      box.innerHTML = pg.items.length ? `<div class="adm-table sup"><div class="tr th"><span>Assunto</span><span>Pessoa</span><span>Categoria</span><span>Atualizado</span><span>Estado</span></div>
+        ${pg.items.map((t) => `<div class="tr" data-tid="${t.id}"><span><b>${esc(t.subject)}</b>${t.last === 'usuario' && t.status !== 'resolvido' ? ' <span class="chip warn">nova msg</span>' : ''}</span>
+          <span class="who">${avatarHtml(t.user)}<span>${esc(t.user.display_name)}</span></span><span class="muted">${esc(t.category)}</span><span class="muted">${admRel(t.updated_at)}</span><span>${ticketChip(t.status)}</span></div>`).join('')}</div>${admPager(pg, load)}`
+        : '<p class="hint">Nenhum pedido aqui.</p>';
+      $$('[data-tid]', box).forEach((row) => { row.onclick = () => admTicket(row.dataset.tid, () => { load(); admPing(); }); });
+      bindPager(box, load);
+    } catch (e) { admErr(e); }
+  };
+  load();
+}
+async function admTicket(tid, reload) {
+  let t;
+  try { t = await admApi(`/api/admin/support/${tid}`); } catch (e) { return admErr(e); }
+  const m = openModal(`<div class="adm-detail">
+    <div class="report-top"><b>${esc(t.subject)}</b><span class="spacer"></span>${ticketChip(t.status)}</div>
+    <p class="hint">${esc(t.user.display_name)} (@${esc(t.user.username)}) · ${esc(t.category)} · aberto ${admWhen(t.created_at, true)}${t.assigned ? ` · atendido por ${esc(t.assigned)}` : ''}</p>
+    <div class="thread-sup">${t.messages.map((x) => `<div class="sm ${x.staff ? 'staff' : ''}"><b>${esc(x.author)}</b> <small>${admRel(x.at)}</small><p>${esc(x.text).replace(/\n/g, '<br>')}</p></div>`).join('')}</div>
+    <div class="field"><label>Responder</label><textarea class="input ta" id="tk-text" rows="3" maxlength="3000" placeholder="Escreva a resposta para a pessoa"></textarea></div>
+    <div class="error-text" id="tk-err"></div>
+    <div class="foot wrap"><select class="input" id="tk-st" style="max-width:190px">${Object.entries(TICKET_STATE).map(([k, [l]]) => `<option value="${k}" ${k === t.status ? 'selected' : ''}>${l}</option>`).join('')}</select>
+      <span class="spacer"></span><button class="btn primary" id="tk-send">${icon('send')}Responder</button></div>
+    <h4 class="perm-title">Histórico</h4><div class="tl">${(t.history || []).slice().reverse().map((h) => `<div class="tl-i"><span class="ic blue">${icon('check')}</span><div>${esc(h.text)}</div><time>${admRel(h.at)}</time></div>`).join('')}</div></div>`, { big: true });
+  $('#tk-st', m).onchange = async (e) => {
+    try { await admApi(`/api/admin/support/${t.id}`, { method: 'PATCH', body: { status: e.target.value } }); toast('Estado atualizado.'); reload?.(); closeModal(); admTicket(tid, reload); } catch (err) { admErr(err); }
+  };
+  $('#tk-send', m).onclick = async (e) => {
+    e.target.disabled = true;
+    try { await admApi(`/api/admin/support/${t.id}/reply`, { method: 'POST', body: { text: $('#tk-text', m).value } }); reload?.(); closeModal(); admTicket(tid, reload); }
+    catch (err) { if (!err.silent) $('#tk-err', m).textContent = err.message; e.target.disabled = false; }
+  };
+}
+
+// ---- cargos e permissões
+const PERM_MATRIX = [
+  ['Ver painel, usuários, comunidades e registro', 1, 1, 1], ['Liberar cadastros', 1, 1, 1], ['Analisar denúncias e responder suporte', 1, 1, 1],
+  ['Advertir contas', 1, 1, 1], ['Suspender contas', 'até 7 dias', 'até 365 dias', 'até 365 dias'], ['Banir e tirar banimento', 0, 1, 1],
+  ['Recusar cadastros', 0, 1, 1], ['Suspender comunidades', 0, 1, 1], ['Publicar atualizações', 0, 1, 1], ['Configurações gerais', 0, 1, 1],
+  ['Nomear moderadores', 0, 1, 1], ['Nomear administradores', 0, 0, 1], ['Excluir contas', 0, 0, 1],
+];
+async function admRoles(body) {
+  const staff = await admApi('/api/admin/staff');
+  const cell = (v) => (v === 1 ? `<span class="yes">${icon('check')}</span>` : v === 0 ? '<span class="no">—</span>' : `<small>${v}</small>`);
+  body.innerHTML = `<div class="adm-grid2">
+    <section class="adm-card"><h3>Equipe (${staff.length})</h3><p class="adm-sub">Ninguém mexe em quem está no mesmo cargo ou acima.</p>
+      ${admUserTable(staff, true)}
+      ${myRank() >= 2 ? `<p class="hint" style="margin-top:12px">Para colocar alguém na equipe: <b>Usuários</b> → ⋮ → <b>Mudar cargo</b>.</p>` : ''}</section>
+    <section class="adm-card"><h3>O que cada cargo pode fazer</h3>
+      <div class="perm-matrix"><div class="pm th"><span></span><span>${roleChip('Moderador')}</span><span>${roleChip('Administrador')}</span><span>${roleChip('Dono')}</span></div>
+        ${PERM_MATRIX.map(([l, a, b, c]) => `<div class="pm"><span>${l}</span>${cell(a)}${cell(b)}${cell(c)}</div>`).join('')}</div>
+      <p class="hint" style="margin-top:12px">🔐 Toda a equipe precisa da verificação em duas etapas ligada para abrir esta área. Todas as ações ficam no registro.</p></section></div>`;
+  bindUserTable(body, staff, () => admRoles(body));
+}
+
+// ---- registro de ações
+async function admAudit(body) {
+  body.innerHTML = `<section class="adm-card"><div class="adm-tools"><div class="adm-search">${icon('compass')}<input class="input" id="al-q" placeholder="Buscar por pessoa, ação ou motivo"></div>
+    <select class="input" id="al-t" style="max-width:200px"><option value="">Tudo</option><option value="user">Contas</option><option value="report">Denúncias</option><option value="server">Comunidades</option><option value="update">Atualizações</option><option value="ticket">Suporte</option><option value="settings">Configurações</option></select></div>
+    <p class="hint">🔒 O registro é permanente: a equipe não consegue apagar nem editar.</p><div id="al-list"><div class="spinner"></div></div></section>`;
+  let page = 1, q = '';
+  const load = async (p = page) => {
+    page = p;
+    try {
+      const pg = await admApi(`/api/admin/audit?q=${encodeURIComponent(q)}&type=${$('#al-t', body).value}&page=${page}&per=30`);
+      const box = $('#al-list', body); if (!box) return;
+      box.innerHTML = pg.items.length ? `<div class="adm-table aud"><div class="tr th"><span>Quando</span><span>Quem</span><span>O quê</span><span>Em quê</span><span>Motivo</span></div>
+        ${pg.items.map((a) => `<div class="tr"><span class="muted">${admWhen(a.at, true)}</span><span><b>${esc(a.actor_name)}</b><small class="muted" style="display:block">${esc(a.actor_role)}</small></span>
+          <span>${esc(a.action)}${a.details ? `<small class="muted" style="display:block">${esc(a.details)}</small>` : ''}</span><span>${esc(a.target_label || '—')}</span><span class="clip">${esc(a.reason || '—')}</span></div>`).join('')}</div>${admPager(pg, load)}`
+        : '<p class="hint">Nenhuma ação encontrada.</p>';
+      bindPager(box, load);
+    } catch (e) { admErr(e); }
+  };
+  let t; $('#al-q', body).oninput = (e) => { q = e.target.value; clearTimeout(t); t = setTimeout(() => load(1), 250); };
+  $('#al-t', body).onchange = () => load(1);
+  load();
+}
+
+// ---- configurações gerais
+async function admSettings(body) {
+  const o = await admApi('/api/admin/overview');
+  const st = o.settings;
+  body.innerHTML = `<div class="adm-grid2">
+    <section class="adm-card"><h3>Verificação de cadastro</h3>
+      <div class="reasons">
+        <label class="reason"><input type="radio" name="ver" value="approval" ${st.verification === 'approval' ? 'checked' : ''}><span><b>Aprovação da equipe</b><br><small class="hint">Quem se cadastra fica esperando até a equipe liberar em Usuários → Esperando.</small></span></label>
+        <label class="reason"><input type="radio" name="ver" value="email" ${st.verification === 'email' ? 'checked' : ''}><span><b>Confirmação por e-mail</b><br><small class="hint">${o.mail_ready ? 'A pessoa recebe um código no e-mail e se libera sozinha.' : 'Precisa ligar o envio de e-mail. Enquanto isso, funciona como aprovação da equipe.'}</small></span></label>
+        <label class="reason"><input type="radio" name="ver" value="off" ${st.verification === 'off' ? 'checked' : ''}><span><b>Sem verificação</b><br><small class="hint">Entra direto depois de se cadastrar.</small></span></label>
+      </div>
+      <div class="switch" style="margin-top:10px"><span>Cadastros abertos<small class="hint" style="display:block">Desligado: ninguém novo consegue criar conta.</small></span><input type="checkbox" id="st-open" ${st.signups_open !== false ? 'checked' : ''}></div></section>
+    <section class="adm-card"><h3>Aviso para todo mundo</h3><p class="adm-sub">Aparece numa faixa no topo do site.</p>
+      <textarea class="input ta" id="st-ann" rows="3" maxlength="280" placeholder="Ex.: 🔧 Manutenção hoje às 22h. Deixe vazio para tirar o aviso.">${esc(st.announcement || '')}</textarea>
+      <h3 style="margin-top:20px">E-mail ${o.mail_ready ? '<span class="chip ok"><i></i>Ligado</span>' : '<span class="chip warn"><i></i>Desligado</span>'}</h3>
+      <p class="hint">Necessário para confirmar e-mails e para a recuperação de senha. Crie uma conta grátis na <b>Brevo</b>, confirme o e-mail remetente e, no Render → <b>Environment</b>, adicione <code>BREVO_API_KEY</code> e <code>MAIL_FROM</code>.</p></section></div>
+    <div class="row" style="margin-top:14px"><button class="btn primary" id="st-save">Salvar configurações</button></div>`;
+  $('#st-save', body).onclick = async () => {
+    const ok = await admConfirm({ title: 'Salvar configurações?', text: 'Vale para toda a Lumix e fica no registro de ações.', reason: false, danger: false, okLabel: 'Salvar' });
+    if (!ok) return;
+    try {
+      await admApi('/api/admin/settings', { method: 'PATCH', body: { verification: $('[name=ver]:checked', body).value, signups_open: $('#st-open', body).checked, announcement: $('#st-ann', body).value } });
+      toast('Configurações salvas.');
+    } catch (e) { admErr(e); }
+  };
+}
+
+// ---------------------------------------------------------------- lado de quem usa: novidades, suporte e avisos
+async function openUpdates() {
+  let list = [];
+  try { list = await api('/api/updates'); } catch (e) { return toast(e.message, true); }
+  openModal(`<h2>${icon('megaphone')} Novidades da Lumix</h2><p class="sub">Novidades, correções e avisos da equipe.</p>
+    <div class="upd-feed">${list.length ? list.map(updateCardHtml).join('') : '<p class="hint">Nada publicado ainda.</p>'}</div>`, { big: true });
+  if (S.me.updates_unseen) { S.me.updates_unseen = 0; api('/api/updates/seen', { method: 'POST' }).catch(() => {}); renderSidebar(); }
+}
+function showNotices() {
+  const list = S.me?.notices || [];
+  if (!list.length) return;
+  const m = openModal(`<h2>⚠️ Você recebeu ${list.length > 1 ? `${list.length} advertências` : 'uma advertência'}</h2>
+    <p class="sub">A equipe da Lumix identificou algo que vai contra as regras da comunidade.</p>
+    ${list.map((n) => `<blockquote>${esc(n.reason)}<br><small class="hint">${admRel(n.at)}</small></blockquote>`).join('')}
+    <p class="hint">Se repetir, a conta pode ser suspensa. Acha que foi um engano? Abra um pedido em Configurações → Suporte.</p>
+    <div class="foot"><button class="btn primary" id="nt-ok">Entendi</button></div>`);
+  $('#nt-ok', m).onclick = () => { closeModal(); S.me.notices = []; api('/api/me/notices/seen', { method: 'POST' }).catch(() => {}); };
+}
+async function usSupport(el, open) {
+  el.innerHTML = '<h3>Suporte</h3><div class="spinner"></div>';
+  let list = [];
+  try { list = await api('/api/support'); } catch (e) { el.innerHTML = `<h3>Suporte</h3><p class="error-text">${esc(e.message)}</p>`; return; }
+  if (open) {
+    let t; try { t = await api(`/api/support/${open}`); } catch (e) { return toast(e.message, true); }
+    el.innerHTML = `<h3><button class="icon-btn" id="sp-back" title="Voltar">←</button> ${esc(t.subject)} ${ticketChip(t.status)}</h3>
+      <div class="thread-sup">${t.messages.map((x) => `<div class="sm ${x.staff ? 'staff' : ''}"><b>${esc(x.author)}</b> <small>${admRel(x.at)}</small><p>${esc(x.text).replace(/\n/g, '<br>')}</p></div>`).join('')}</div>
+      <div class="field"><label>${t.status === 'resolvido' ? 'Responder reabre o pedido' : 'Responder'}</label><textarea class="input ta" id="sp-text" rows="3" maxlength="3000"></textarea></div>
+      <div class="error-text" id="sp-err"></div><button class="btn primary" id="sp-send">${icon('send')}Enviar</button>`;
+    $('#sp-back', el).onclick = () => usSupport(el);
+    $('#sp-send', el).onclick = async () => {
+      try { await api(`/api/support/${t.id}/messages`, { method: 'POST', body: { text: $('#sp-text', el).value } }); usSupport(el, t.id); } catch (e) { $('#sp-err', el).textContent = e.message; }
+    };
+    return;
+  }
+  el.innerHTML = `<h3>Suporte</h3>
+    <p class="hint" style="margin:-8px 0 14px">Precisa de ajuda, achou um erro ou quer contestar uma punição? Abra um pedido — a equipe responde por aqui.</p>
+    ${list.length ? `<h4 class="perm-title">Seus pedidos</h4>${list.map((t) => `<button class="mini-row clickable sup-row" data-t="${t.id}"><b>${esc(t.subject)}</b><span class="spacer"></span>${t.last === 'equipe' && t.status !== 'resolvido' ? '<span class="chip blue">resposta nova</span>' : ''}${ticketChip(t.status)}<small class="muted">${admRel(t.updated_at)}</small></button>`).join('')}` : ''}
+    <h4 class="perm-title">Novo pedido</h4>
+    <div class="field"><label>Categoria</label><select class="input" id="sp-cat">${['Conta e login', 'Chamadas', 'Mensagens', 'Comunidades', 'Denúncia', 'Sugestão', 'Outro'].map((c) => `<option>${c}</option>`).join('')}</select></div>
+    <div class="field"><label>Assunto</label><input class="input" id="sp-sub" maxlength="100"></div>
+    <div class="field"><label>Descreva</label><textarea class="input ta" id="sp-new" rows="5" maxlength="3000" placeholder="O que aconteceu, o que você esperava e o que já tentou"></textarea></div>
+    <div class="error-text" id="sp-err"></div><button class="btn primary" id="sp-open">Abrir pedido</button>`;
+  $$('[data-t]', el).forEach((b) => { b.onclick = () => usSupport(el, b.dataset.t); });
+  $('#sp-open', el).onclick = async (e) => {
+    e.target.disabled = true;
+    try { const t = await api('/api/support', { method: 'POST', body: { category: $('#sp-cat', el).value, subject: $('#sp-sub', el).value, text: $('#sp-new', el).value } }); toast('Pedido aberto! A equipe vai responder aqui.'); usSupport(el, t.id); }
+    catch (err) { $('#sp-err', el).textContent = err.message; e.target.disabled = false; }
+  };
+}
+
+function renderAnnouncement() {
+  $('.announce')?.remove();
+  document.body.classList.remove('has-announce');
+  const text = S.me?.announcement;
+  if (!text || S.annClosed === text) return;
+  document.body.classList.add('has-announce');
+  const bar = document.createElement('div');
+  bar.className = 'announce';
+  bar.innerHTML = `<span>📢 ${esc(text)}</span><button class="icon-btn" title="Fechar">${icon('x')}</button>`;
+  bar.querySelector('button').onclick = () => { S.annClosed = text; bar.remove(); document.body.classList.remove('has-announce'); };
+  document.body.appendChild(bar);
 }
 
 // =============================================================== início
