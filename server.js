@@ -14,7 +14,7 @@ const SESSION_DAYS = 30;
 
 // ---------------------------------------------------------------- banco
 fs.mkdirSync(DATA_DIR, { recursive: true });
-const EMPTY = { users: [], sessions: [], servers: [], members: [], channels: [], messages: [], roles: [], dms: [], dm_messages: [], uploads: [] };
+const EMPTY = { users: [], sessions: [], servers: [], members: [], channels: [], messages: [], roles: [], dms: [], dm_messages: [], uploads: [], friends: [] };
 let db;
 try {
   db = { ...JSON.parse(JSON.stringify(EMPTY)), ...JSON.parse(fs.readFileSync(DB_FILE, 'utf8')) };
@@ -39,6 +39,8 @@ db.servers.forEach((s) => {
 });
 db.members.forEach((m) => { if (!Array.isArray(m.role_ids)) m.role_ids = []; });
 Object.keys(EMPTY).forEach((k) => { if (!Array.isArray(db[k])) db[k] = []; });
+// todo usuário precisa de um nome de usuário único
+db.users.forEach((u) => { if (!u.username) u.username = makeUsername(u.display_name); });
 }
 
 let saveTimer = null;
@@ -77,7 +79,19 @@ function checkPassword(pw, stored) {
   return crypto.timingSafeEqual(crypto.scryptSync(pw, salt, 64), Buffer.from(hash, 'hex'));
 }
 
-const publicUser = (u) => u && ({ id: u.id, display_name: u.display_name, avatar_url: u.avatar_url || '', email: u.email });
+const publicUser = (u) => u && ({ id: u.id, username: u.username || '', display_name: u.display_name, avatar_url: u.avatar_url || '', email: u.email });
+// dados de outra pessoa (sem e-mail)
+const personOf = (u) => u && ({ id: u.id, username: u.username || '', display_name: u.display_name, avatar_url: u.avatar_url || '', online: socketsOf(u.id).length > 0 });
+const USERNAME_RE = /^[a-z0-9_.]{3,20}$/;
+function normUsername(v) { return String(v || '').trim().toLowerCase().replace(/^@/, ''); }
+function usernameTaken(name, exceptId) { return db.users.some((u) => u.username === name && u.id !== exceptId); }
+function makeUsername(base) {
+  let b = String(base || 'user').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9_.]/g, '').slice(0, 14);
+  if (b.length < 3) b = (b + 'user').slice(0, 6);
+  let n = b;
+  while (usernameTaken(n)) n = `${b}${Math.floor(1000 + Math.random() * 9000)}`;
+  return n;
+}
 const userById = (uid) => db.users.find((u) => u.id === uid);
 const memberOf = (sid, uid) => db.members.find((m) => m.server_id === sid && m.user_id === uid);
 const isMember = (sid, uid) => !!memberOf(sid, uid);
@@ -104,10 +118,9 @@ function canSee(c, uid) {
   const m = memberOf(c.server_id, uid);
   return c.allowed_roles.some((r) => m.role_ids.includes(r));
 }
-function canAttach(c, uid) {
-  const staff = permsOf(c.server_id, uid).manage_messages;
+function canAttach(c) {
   const a = c.allow || {};
-  return { images: staff || a.images !== false, files: staff || a.files !== false, audio: staff || a.audio !== false };
+  return { images: a.images !== false, files: a.files !== false, audio: a.audio !== false };
 }
 function canPost(c, uid) {
   return canSee(c, uid) && (!c.read_only || permsOf(c.server_id, uid).manage_messages);
@@ -564,7 +577,12 @@ app.post('/api/auth/register', (req, res) => {
   if (!/^\S+@\S+\.\S+$/.test(email)) return bad(res, 'E-mail inválido.');
   if (password.length < 6) return bad(res, 'A senha precisa ter pelo menos 6 caracteres.');
   if (db.users.some((u) => u.email === email)) return bad(res, 'Este e-mail já está cadastrado.');
-  const user = { id: id(), email, display_name, avatar_url: '', password: hashPassword(password), created_at: now() };
+  let username = normUsername(req.body.username);
+  if (username) {
+    if (!USERNAME_RE.test(username)) return bad(res, 'Nome de usuário: 3 a 20 letras minúsculas, números, _ ou ponto.');
+    if (usernameTaken(username)) return bad(res, 'Esse nome de usuário já está em uso.');
+  } else username = makeUsername(display_name);
+  const user = { id: id(), email, username, display_name, avatar_url: '', password: hashPassword(password), created_at: now() };
   db.users.push(user);
   setSession(req, res, user.id);
   res.json(publicUser(user));
@@ -586,6 +604,12 @@ app.post('/api/auth/logout', (req, res) => {
 app.get('/api/me', auth, (req, res) => res.json(publicUser(req.user)));
 app.patch('/api/me', auth, (req, res) => {
   const { display_name, avatar_url } = req.body;
+  if (req.body.username !== undefined) {
+    const un = normUsername(req.body.username);
+    if (!USERNAME_RE.test(un)) return bad(res, 'Nome de usuário: 3 a 20 letras minúsculas, números, _ ou ponto.');
+    if (usernameTaken(un, req.user.id)) return bad(res, 'Esse nome de usuário já está em uso.');
+    req.user.username = un;
+  }
   if (display_name !== undefined) {
     const n = cleanStr(display_name, 32);
     if (!n) return bad(res, 'O nome não pode ficar vazio.');
@@ -598,6 +622,7 @@ app.patch('/api/me', auth, (req, res) => {
   save();
   const pu = publicUser(req.user);
   db.members.filter((m) => m.user_id === req.user.id).forEach((m) => io.to(`server:${m.server_id}`).emit('user:updated', { ...pu, email: undefined }));
+  friendIdsOf(req.user.id).forEach((f) => io.to(`user:${f}`).emit('friends:update'));
   res.json(pu);
 });
 app.post('/api/me/password', auth, (req, res) => {
@@ -745,7 +770,7 @@ app.get('/api/servers/:sid/members', auth, (req, res) => {
   const s = requireMember(req, res); if (!s) return;
   res.json(db.members.filter((m) => m.server_id === s.id).map((m) => {
     const u = userById(m.user_id); if (!u) return null;
-    return { id: u.id, display_name: u.display_name, avatar_url: u.avatar_url || '', joined_at: m.joined_at, role_ids: m.role_ids,
+    return { id: u.id, username: u.username || '', display_name: u.display_name, avatar_url: u.avatar_url || '', joined_at: m.joined_at, role_ids: m.role_ids,
       is_owner: m.user_id === s.owner_id, online: socketsOf(m.user_id).length > 0, color: topRole(s.id, u.id)?.color || '' };
   }).filter(Boolean));
 });
@@ -983,6 +1008,12 @@ function sharesServer(a, b) {
   return db.members.some((m) => m.user_id === b && mine.has(m.server_id));
 }
 const dmById = (x) => db.dms.find((d) => d.id === x);
+// conversa vira "solicitação de mensagem" para quem recebeu de alguém que não é amigo, até aceitar ou responder
+function isDmRequest(d, uid) {
+  if (d.accepted?.[uid] || d.created_by === uid || !d.created_by) return false;
+  const other = d.user_ids.find((u) => u !== uid);
+  return !areFriends(uid, other);
+}
 function dmPayload(d, uid) {
   const other = userById(d.user_ids.find((u) => u !== uid) || uid);
   const msgs = db.dm_messages.filter((m) => m.dm_id === d.id);
@@ -990,7 +1021,8 @@ function dmPayload(d, uid) {
   const read = d.read?.[uid] || '';
   return {
     id: d.id, last_at: d.last_at,
-    user: other ? { id: other.id, display_name: other.display_name, avatar_url: other.avatar_url || '', online: socketsOf(other.id).length > 0 } : { id: '', display_name: 'Conta removida', avatar_url: '' },
+    user: other ? personOf(other) : { id: '', username: '', display_name: 'Conta removida', avatar_url: '' },
+    request: isDmRequest(d, uid),
     last_message: last ? { content: (last.content || (last.attachments?.length ? `📎 ${last.attachments[0].kind === 'audio' ? 'Áudio' : last.attachments[0].kind === 'image' ? 'Imagem' : 'Arquivo'}` : '')).slice(0, 80), mine: last.author_id === uid } : null,
     unread: msgs.filter((m) => m.author_id !== uid && m.created_at > read).length,
   };
@@ -1007,7 +1039,8 @@ function requireDm(req, res) {
 app.get('/api/people', auth, (req, res) => {
   const mine = new Set(db.members.filter((m) => m.user_id === req.user.id).map((m) => m.server_id));
   const ids = new Set(db.members.filter((m) => mine.has(m.server_id) && m.user_id !== req.user.id).map((m) => m.user_id));
-  res.json([...ids].map(userById).filter(Boolean).map((u) => ({ id: u.id, display_name: u.display_name, avatar_url: u.avatar_url || '', online: socketsOf(u.id).length > 0 }))
+  friendIdsOf(req.user.id).forEach((f) => ids.add(f));
+  res.json([...ids].map(userById).filter(Boolean).map((u) => ({ ...personOf(u), friend: areFriends(req.user.id, u.id) }))
     .sort((a, b) => (b.online - a.online) || a.display_name.localeCompare(b.display_name)));
 });
 app.get('/api/dms', auth, (req, res) => {
@@ -1018,8 +1051,8 @@ app.post('/api/dms', auth, (req, res) => {
   if (!other || other.id === req.user.id) return bad(res, 'Pessoa não encontrada.', 404);
   let d = db.dms.find((x) => x.user_ids.includes(req.user.id) && x.user_ids.includes(other.id));
   if (!d) {
-    if (!sharesServer(req.user.id, other.id)) return bad(res, 'Vocês precisam estar em um servidor em comum.', 403);
-    d = { id: id(), user_ids: [req.user.id, other.id], created_at: now(), last_at: now(), read: {} };
+    if (!areFriends(req.user.id, other.id) && !sharesServer(req.user.id, other.id)) return bad(res, 'Adicione essa pessoa como amiga para conversar.', 403);
+    d = { id: id(), user_ids: [req.user.id, other.id], created_by: req.user.id, accepted: { [req.user.id]: true }, created_at: now(), last_at: now(), read: {} };
     db.dms.push(d); save();
   }
   res.json(dmPayload(d, req.user.id));
@@ -1040,6 +1073,7 @@ app.post('/api/dms/:did/messages', auth, (req, res) => {
   const attachments = takeAttachments(req, res); if (!attachments) return;
   if (!content && !attachments.length) return bad(res, 'Mensagem vazia.');
   const m = { id: id(), dm_id: d.id, author_id: req.user.id, content, attachments, created_at: now() };
+  d.accepted = d.accepted || {}; d.accepted[req.user.id] = true;
   db.dm_messages.push(m);
   d.last_at = m.created_at;
   d.read = d.read || {}; d.read[req.user.id] = m.created_at;
@@ -1062,6 +1096,94 @@ app.delete('/api/dm-messages/:mid', auth, (req, res) => {
   save();
   const d = dmById(m.dm_id);
   d?.user_ids.forEach((u) => io.to(`user:${u}`).emit('dm:deleted', { id: m.id, dm_id: m.dm_id }));
+  res.json({ ok: true });
+});
+
+app.post('/api/dms/:did/accept', auth, (req, res) => {
+  const d = requireDm(req, res); if (!d) return;
+  d.accepted = d.accepted || {}; d.accepted[req.user.id] = true;
+  save();
+  res.json(dmPayload(d, req.user.id));
+});
+app.delete('/api/dms/:did', auth, (req, res) => {
+  const d = requireDm(req, res); if (!d) return;
+  // recusar uma solicitação apaga a conversa
+  removeUploads(attIds(db.dm_messages.filter((m) => m.dm_id === d.id)));
+  db.dm_messages = db.dm_messages.filter((m) => m.dm_id !== d.id);
+  db.dms = db.dms.filter((x) => x.id !== d.id);
+  save();
+  d.user_ids.forEach((u) => io.to(`user:${u}`).emit('dm:removed', { id: d.id }));
+  res.json({ ok: true });
+});
+
+// ---- amigos
+const pairKey = (a, b) => (a < b ? `${a}:${b}` : `${b}:${a}`);
+const friendRow = (a, b) => db.friends.find((f) => f.key === pairKey(a, b));
+function areFriends(a, b) { return friendRow(a, b)?.status === 'accepted'; }
+function friendIdsOf(uid) {
+  return db.friends.filter((f) => f.status === 'accepted' && (f.from === uid || f.to === uid)).map((f) => (f.from === uid ? f.to : f.from));
+}
+function notifyFriends(...ids) { ids.forEach((u) => io.to(`user:${u}`).emit('friends:update')); }
+app.get('/api/friends', auth, (req, res) => {
+  const me = req.user.id;
+  const mine = db.friends.filter((f) => f.from === me || f.to === me);
+  const other = (f) => personOf(userById(f.from === me ? f.to : f.from));
+  res.json({
+    friends: mine.filter((f) => f.status === 'accepted').map((f) => ({ id: f.id, since: f.accepted_at, user: other(f) })).filter((x) => x.user)
+      .sort((a, b) => (b.user.online - a.user.online) || a.user.display_name.localeCompare(b.user.display_name)),
+    incoming: mine.filter((f) => f.status === 'pending' && f.to === me).map((f) => ({ id: f.id, message: f.message || '', created_at: f.created_at, user: other(f) })).filter((x) => x.user),
+    outgoing: mine.filter((f) => f.status === 'pending' && f.from === me).map((f) => ({ id: f.id, message: f.message || '', created_at: f.created_at, user: other(f) })).filter((x) => x.user),
+  });
+});
+function acceptFriend(f) {
+  f.status = 'accepted'; f.accepted_at = now();
+  // a mensagem do pedido aparece na conversa privada
+  let d = db.dms.find((x) => x.user_ids.includes(f.from) && x.user_ids.includes(f.to));
+  if (!d) { d = { id: id(), user_ids: [f.from, f.to], created_by: f.from, accepted: { [f.from]: true, [f.to]: true }, created_at: now(), last_at: now(), read: {} }; db.dms.push(d); }
+  else { d.accepted = { ...(d.accepted || {}), [f.from]: true, [f.to]: true }; }
+  if (f.message) {
+    const m = { id: id(), dm_id: d.id, author_id: f.from, content: f.message, attachments: [], created_at: now() };
+    db.dm_messages.push(m); d.last_at = m.created_at;
+    const p = dmMessagePayload(m);
+    d.user_ids.forEach((u) => io.to(`user:${u}`).emit('dm:message', { dm: dmPayload(d, u), message: p }));
+  }
+}
+const frRate = new Map();
+app.post('/api/friends', auth, (req, res) => {
+  const me = req.user.id;
+  const username = normUsername(req.body.username);
+  const message = cleanStr(req.body.message, 120);
+  if (!username) return bad(res, 'Digite o nome de usuário.');
+  const other = db.users.find((u) => u.username === username);
+  if (!other) return bad(res, 'Hm, não encontramos ninguém com esse nome de usuário. Confira se digitou certinho.', 404);
+  if (other.id === me) return bad(res, 'Esse é você! 😅');
+  const t = Date.now();
+  const hits = (frRate.get(me) || []).filter((x) => t - x < 60000);
+  if (hits.length >= 10) return bad(res, 'Muitos pedidos seguidos. Espere um pouco.', 429);
+  hits.push(t); frRate.set(me, hits);
+  let f = friendRow(me, other.id);
+  if (f?.status === 'accepted') return bad(res, `Você e ${other.display_name} já são amigos.`);
+  if (f && f.from === me) return bad(res, 'Você já mandou um pedido para essa pessoa.');
+  if (f && f.to === me) { acceptFriend(f); save(); notifyFriends(me, other.id); return res.json({ ok: true, accepted: true, user: personOf(other) }); }
+  f = { id: id(), key: pairKey(me, other.id), from: me, to: other.id, status: 'pending', message, created_at: now() };
+  db.friends.push(f); save();
+  notifyFriends(me, other.id);
+  io.to(`user:${other.id}`).emit('friends:request', { from: personOf(req.user), message });
+  res.json({ ok: true, user: personOf(other) });
+});
+app.post('/api/friends/:fid/accept', auth, (req, res) => {
+  const f = db.friends.find((x) => x.id === req.params.fid);
+  if (!f || f.to !== req.user.id || f.status !== 'pending') return bad(res, 'Pedido não encontrado.', 404);
+  acceptFriend(f); save();
+  notifyFriends(f.from, f.to);
+  res.json({ ok: true });
+});
+app.delete('/api/friends/:fid', auth, (req, res) => {
+  const f = db.friends.find((x) => x.id === req.params.fid);
+  if (!f || (f.from !== req.user.id && f.to !== req.user.id)) return bad(res, 'Não encontrado.', 404);
+  db.friends = db.friends.filter((x) => x.id !== f.id);
+  save();
+  notifyFriends(f.from, f.to);
   res.json({ ok: true });
 });
 

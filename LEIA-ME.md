@@ -63,7 +63,8 @@ Opcional: `GEMINI_MODEL` ou `AI_MODEL` para escolher o modelo.
 - Em cada canal a Staff escolhe o que pode ser enviado (imagens, arquivos, áudios) ou deixa só texto
 - Chamadas: microfone, silenciar áudio, câmera, compartilhar tela, tela cheia, indicador de quem está falando, lista de quem está na sala
 - Voz e vídeo: escolher microfone, saída de áudio e câmera, testar microfone e câmera, cancelamento de eco e supressão de ruído
-- Conversas privadas (mensagens diretas) com contador de não lidas
+- Amigos por nome de usuário (@), pedidos de amizade com mensagem, lista Disponível/Todos/Pendente
+- Conversas privadas com contador de não lidas e "Solicitações de mensagens" para quem não é amigo
 - Cargos com cores e permissões, categorias, canais privados e só leitura, modelo streamer
 - IA que monta o servidor do seu jeito
 - Teclas de atalho configuráveis (aperte `?` no site) e "apertar para falar"
