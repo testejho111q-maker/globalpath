@@ -38,6 +38,7 @@ const ICONS = {
   users: '<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.9M16 3.1a4 4 0 0 1 0 7.8"/>',
   userPlus: '<path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><path d="M20 8v6M23 11h-6"/>',
   menu: '<path d="M3 12h18M3 6h18M3 18h18"/>',
+  chat: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
   compass: '<circle cx="12" cy="12" r="10"/><path d="m16.2 7.8-2.1 6.3-6.3 2.1 2.1-6.3z"/>',
   edit: '<path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/>',
   copy: '<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
@@ -142,6 +143,8 @@ const S = {
   hasMore: {},       // cid -> bool
   voice: {},         // cid -> participantes
   roles: {},         // sid -> cargos
+  dmId: null,
+  dms: [],
   ssRefresh: null,
   collapsed: (() => { try { return new Set(JSON.parse(localStorage.getItem('gp_collapsed') || '[]')); } catch { return new Set(); } })(),
   navOpen: false,
@@ -164,10 +167,15 @@ async function route() {
   const join = p.match(/^\/join\/([\w-]+)/);
   if (join) return showInvite(join[1]);
   const m = p.match(/^\/s\/([\w]+)(?:\/([\w]+))?/);
+  const dm = p.match(/^\/dm\/([\w]+)/);
   if (m && S.servers.some((s) => s.id === m[1])) {
+    S.dmId = null;
     await openServer(m[1], m[2]);
+  } else if (dm && S.dms.some((d) => d.id === dm[1])) {
+    S.serverId = null; S.channelId = null; S.dmId = dm[1];
+    renderApp();
   } else {
-    S.serverId = null; S.channelId = null;
+    S.serverId = null; S.channelId = null; S.dmId = null;
     if (p !== '/') history.replaceState({}, '', '/');
     renderApp();
   }
@@ -209,7 +217,7 @@ function renderAuth(mode = 'login') {
 }
 
 async function startSession() {
-  S.servers = await api('/api/servers');
+  [S.servers, S.dms] = await Promise.all([api('/api/servers'), api('/api/dms').catch(() => [])]);
   connectSocket();
   route();
 }
@@ -218,7 +226,7 @@ async function logout() {
   if (call) leaveCall();
   await api('/api/auth/logout', { method: 'POST' }).catch(() => {});
   socket?.disconnect(); socket = null;
-  Object.assign(S, { me: null, servers: [], serverId: null, channelId: null, channels: {}, messages: {}, voice: {}, roles: {} });
+  Object.assign(S, { me: null, servers: [], serverId: null, channelId: null, dmId: null, dms: [], channels: {}, messages: {}, voice: {}, roles: {} });
   history.replaceState({}, '', '/');
   renderAuth('login');
 }
@@ -229,16 +237,27 @@ function connectSocket() {
   socket.on('connect', () => { if (S.serverId) refreshVoice(S.serverId); });
   socket.on('connect_error', (e) => { if (e.message === 'unauthorized') logout(); });
 
-  socket.on('message:created', (m) => {
-    const list = S.messages[m.channel_id];
-    if (list && !list.some((x) => x.id === m.id)) {
-      list.push(m);
-      if (m.channel_id === S.channelId) appendMessage(m);
+  socket.on('message:created', (m) => addMessage(m.channel_id, m));
+  socket.on('dm:message', ({ dm, message }) => {
+    const viewing = !S.serverId && S.dmId === dm.id && document.visibilityState === 'visible';
+    if (viewing) dm.unread = 0;
+    upsertDm(dm);
+    addMessage(dm.id, message);
+    if (viewing && message.author_id !== S.me.id) api(`/api/dms/${dm.id}/read`, { method: 'POST' }).catch(() => {});
+    if (!viewing && message.author_id !== S.me.id) {
+      toast(`💬 ${message.author_name}: ${message.content.slice(0, 60)}`);
+      try { if (document.visibilityState !== 'visible' && Notification?.permission === 'granted') new Notification(message.author_name, { body: message.content.slice(0, 120) }); } catch { /* ignora */ }
     }
+    renderRail();
+    if (!S.serverId) renderSidebar();
+  });
+  socket.on('dm:deleted', ({ id, dm_id }) => {
+    if (S.messages[dm_id]) S.messages[dm_id] = S.messages[dm_id].filter((m) => m.id !== id);
+    if (!S.serverId && S.dmId === dm_id) renderMessages(true);
   });
   socket.on('message:deleted', ({ id, channel_id }) => {
     if (S.messages[channel_id]) S.messages[channel_id] = S.messages[channel_id].filter((m) => m.id !== id);
-    if (channel_id === S.channelId) renderMessages(true);
+    if (channel_id === threadId()) renderMessages(true);
   });
   socket.on('server:refresh', ({ server_id }) => scheduleRefresh(server_id));
   const dropServer = ({ id }) => {
@@ -251,7 +270,7 @@ function connectSocket() {
   socket.on('user:updated', (u) => {
     if (u.id === S.me.id) S.me = { ...S.me, ...u };
     Object.values(S.messages).forEach((l) => l.forEach((m) => { if (m.author_id === u.id) { m.author_name = u.display_name; m.author_avatar = u.avatar_url; } }));
-    if (S.channelId && chan()?.kind === 'text') renderMessages(true);
+    if (threadFor()) renderMessages(true);
   });
   socket.on('voice:state', ({ channel_id, participants }) => {
     S.voice[channel_id] = participants;
@@ -325,8 +344,8 @@ function setNav(open) {
 function renderRail() {
   const el = $('#rail'); if (!el) return;
   el.innerHTML = `
-    <div class="rail-item ${!S.serverId ? 'active' : ''}" data-tip="Início"><span class="pill"></span>
-      <button class="rail-add home" data-go="/">${icon('compass')}</button></div>
+    <div class="rail-item ${!S.serverId ? 'active' : ''}" data-tip="Conversas"><span class="pill"></span>
+      <button class="rail-add home" data-go="/">${icon('chat')}</button>${totalUnread() ? `<span class="rail-badge">${totalUnread() > 99 ? '99+' : totalUnread()}</span>` : ''}</div>
     <div class="sep"></div>
     ${S.servers.map((s) => `
       <div class="rail-item ${s.id === S.serverId ? 'active' : ''}" data-tip="${esc(s.name)}"><span class="pill"></span>
@@ -358,10 +377,7 @@ function renderSidebar() {
   const s = current();
   let body;
   if (!s) {
-    body = `<div class="sidebar-head"><div class="server-name-btn" style="cursor:default"><span class="n">Seus servidores</span></div></div>
-    <div class="channels">${S.servers.length ? S.servers.map((x) => `
-      <button class="channel" data-go="/s/${x.id}">${serverIconHtml(x, 'mini-icon')}<span class="n">${esc(x.name)}</span></button>`).join('')
-      : '<p class="hint" style="padding:8px">Você ainda não está em nenhum servidor.</p>'}</div>`;
+    body = renderHomeSidebar();
   } else {
     const chs = S.channels[s.id] || [];
     const p = s.perms || {};
@@ -433,6 +449,7 @@ function renderSidebar() {
     };
   });
   $('#server-menu-btn')?.addEventListener('click', (e) => serverMenu(e.currentTarget));
+  $('#dm-new')?.addEventListener('click', newDmDialog);
   $('#me-btn').onclick = () => userSettings('profile');
   $('#ub-settings').onclick = () => userSettings('profile');
   $('#ub-logout').onclick = () => { if (confirm('Deseja sair da sua conta?')) logout(); };
@@ -446,7 +463,7 @@ function renderHead() {
   const h = $('.main-head'); if (!h) return;
   const c = chan();
   h.innerHTML = `<button class="icon-btn menu-toggle" id="menu-toggle">${icon('menu')}</button>
-    ${c ? `${icon(c.kind === 'voice' ? 'volume' : c.read_only ? 'megaphone' : 'hash', 'muted')}<span>${esc(c.name)}</span>${c.topic ? `<span class="topic">${esc(c.topic)}</span>` : ''}` : `<span>${esc(current()?.name || 'Início')}</span>`}
+    ${!S.serverId && S.dmId ? (() => { const d = S.dms.find((x) => x.id === S.dmId); return d ? `${avatarHtml(d.user, 'sm')}<span>${esc(d.user.display_name)}</span><span class="topic">${d.user.online ? 'Online' : 'Offline'}</span>` : ''; })() : c ? `${icon(c.kind === 'voice' ? 'volume' : c.read_only ? 'megaphone' : 'hash', 'muted')}<span>${esc(c.name)}</span>${c.topic ? `<span class="topic">${esc(c.topic)}</span>` : ''}` : `<span>${esc(current()?.name || 'Conversas')}</span>`}
     <span class="spacer"></span>
     ${current() ? `<button class="icon-btn" id="head-invite" title="Convidar pessoas">${icon('userPlus')}</button>
     <button class="icon-btn" id="head-members" title="Membros">${icon('users')}</button>` : ''}`;
@@ -459,17 +476,21 @@ function renderMain() {
   const el = $('#main'); if (!el) return;
   const s = current();
   const c = chan();
+  if (!s && S.dmId && threadFor()) return renderThread(el);
   if (!s) {
     el.innerHTML = `<div class="main-head"></div>
       <div class="empty"><div>
         <div class="ico">${icon('compass')}</div>
         <h2>Olá, ${esc(S.me.display_name)}!</h2>
         <p>${S.servers.length ? 'Escolha um servidor na barra lateral ou crie um novo.' : 'Crie seu primeiro servidor ou entre em um com um convite de um amigo.'}</p>
-        <div class="row"><button class="btn primary" id="e-create">${icon('plus')}Criar servidor</button><button class="btn" id="e-join">${icon('link')}Tenho um convite</button></div>
+        <div class="row"><button class="btn primary" id="e-create">${icon('plus')}Criar servidor</button><button class="btn" id="e-ai">${icon('sparkle')}Montar com IA</button><button class="btn" id="e-join">${icon('link')}Tenho um convite</button><button class="btn" id="e-dm">${icon('chat')}Nova conversa</button></div>
+        <p class="hint" style="margin-top:18px">Dica: aperte <kbd>?</kbd> para ver as teclas de atalho.</p>
       </div></div>`;
     renderHead();
     $('#e-create').onclick = () => createServerDialog();
     $('#e-join').onclick = () => joinDialog();
+    $('#e-dm').onclick = () => newDmDialog();
+    $('#e-ai').onclick = () => aiBuildDialog();
     return;
   }
   if (!c) {
@@ -477,7 +498,7 @@ function renderMain() {
     renderHead();
     return;
   }
-  if (c.kind === 'text') return renderTextChannel(el, c);
+  if (c.kind === 'text') return renderThread(el);
   return renderVoiceChannel(el, c);
 }
 
@@ -502,17 +523,31 @@ async function openServer(sid, cid) {
   renderApp();
 }
 
-// ---------------------------------------------------------------- chat
-function renderTextChannel(el, c) {
+// ---------------------------------------------------------------- chat (canais de texto e conversas privadas)
+const threadId = () => (S.serverId ? S.channelId : S.dmId);
+function threadFor() {
+  if (!S.serverId) {
+    const d = S.dms.find((x) => x.id === S.dmId); if (!d) return null;
+    return { id: d.id, dm: d, base: `/api/dms/${d.id}/messages`, canPost: true, placeholder: `Conversar com @${d.user.display_name}`,
+      canDel: (m) => m.author_id === S.me.id, delUrl: (x) => `/api/dm-messages/${x}`,
+      welcome: `<div class="welcome">${avatarHtml(d.user, 'lg')}<h2 style="margin-top:12px">${esc(d.user.display_name)}</h2><p>Este é o começo da sua conversa com <b>${esc(d.user.display_name)}</b>.</p></div>` };
+  }
+  const c = chan(); if (!c || c.kind !== 'text') return null;
+  return { id: c.id, chan: c, base: `/api/channels/${c.id}/messages`, canPost: c.can_post, placeholder: `Conversar em #${c.name}`,
+    canDel: (m) => m.author_id === S.me.id || !!current()?.perms?.manage_messages, delUrl: (x) => `/api/messages/${x}`,
+    welcome: `<div class="welcome"><div class="big">${icon('hash')}</div><h2>Bem-vindo a #${esc(c.name)}!</h2><p>${c.topic ? esc(c.topic) : `Este é o começo do canal #${esc(c.name)}.`}</p></div>` };
+}
+function renderThread(el) {
+  const t = threadFor(); if (!t) return;
   el.innerHTML = `<div class="main-head"></div>
     <div class="messages" id="messages"></div>
-    ${c.can_post ? `<form class="composer" id="composer"><div class="composer-box">
-      <textarea id="msg-input" rows="1" maxlength="2000" placeholder="Conversar em #${esc(c.name)}"></textarea>
+    ${t.canPost ? `<form class="composer" id="composer"><div class="composer-box">
+      <textarea id="msg-input" rows="1" maxlength="2000" placeholder="${esc(t.placeholder)}"></textarea>
       <button class="send" type="submit" disabled title="Enviar">${icon('send')}</button></div></form>`
     : `<div class="composer"><div class="composer-box readonly">${icon('lock')}Você não tem permissão para enviar mensagens neste canal.</div></div>`}`;
   renderHead();
-  loadMessages(c);
-  if (!c.can_post) return;
+  loadMessages(t);
+  if (!t.canPost) return;
   const ta = $('#msg-input');
   const sendBtn = $('#composer .send');
   const grow = () => { ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 180) + 'px'; sendBtn.disabled = !ta.value.trim(); };
@@ -523,28 +558,40 @@ function renderTextChannel(el, c) {
     const content = ta.value.trim(); if (!content) return;
     ta.value = ''; grow();
     try {
-      const m = await api(`/api/channels/${c.id}/messages`, { method: 'POST', body: { content } });
-      const list = S.messages[c.id] || (S.messages[c.id] = []);
-      if (!list.some((x) => x.id === m.id)) { list.push(m); if (S.channelId === c.id) appendMessage(m); }
+      const m = await api(t.base, { method: 'POST', body: { content } });
+      addMessage(t.id, m);
     } catch (err) { toast(err.message, true); ta.value = content; grow(); }
   };
   if (window.innerWidth > 800) ta.focus();
 }
-function loadMessages(c) {
-  if (S.messages[c.id]) renderMessages(true);
-  else {
-    $('#messages').innerHTML = '<div class="boot" style="height:100%"><div class="spinner"></div></div>';
-    api(`/api/channels/${c.id}/messages`).then((list) => {
-      S.messages[c.id] = list; S.hasMore[c.id] = list.length >= 50;
-      if (S.channelId === c.id) renderMessages(true);
-    }).catch((e) => toast(e.message, true));
-  }
+function addMessage(tid, m) {
+  const list = S.messages[tid];
+  if (!list || list.some((x) => x.id === m.id)) return;
+  list.push(m);
+  if (threadId() === tid) appendMessage(m);
+}
+function loadMessages(t) {
+  if (S.messages[t.id]) { renderMessages(true); return markRead(); }
+  $('#messages').innerHTML = '<div class="boot" style="height:100%"><div class="spinner"></div></div>';
+  api(t.base).then((list) => {
+    S.messages[t.id] = list; S.hasMore[t.id] = list.length >= 50;
+    if (threadId() === t.id) { renderMessages(true); markRead(); }
+  }).catch((e) => toast(e.message, true));
+}
+let readTimer = null;
+function markRead() {
+  if (S.serverId || !S.dmId) return;
+  const d = S.dms.find((x) => x.id === S.dmId);
+  if (!d || !d.unread) return;
+  d.unread = 0; renderRail(); renderSidebar();
+  clearTimeout(readTimer);
+  readTimer = setTimeout(() => api(`/api/dms/${d.id}/read`, { method: 'POST' }).catch(() => {}), 300);
 }
 
-function messageHtml(m, prev) {
+function messageHtml(m, prev, t) {
   const head = !prev || prev.author_id !== m.author_id || new Date(m.created_at) - new Date(prev.created_at) > 7 * 60e3 || fmtDay(prev.created_at) !== fmtDay(m.created_at);
   const day = !prev || fmtDay(prev.created_at) !== fmtDay(m.created_at) ? `<div class="day-sep">${fmtDay(m.created_at)}</div>` : '';
-  const canDel = m.author_id === S.me.id || current()?.perms?.manage_messages;
+  const canDel = t?.canDel(m);
   const user = { display_name: m.author_name, avatar_url: m.author_avatar };
   return `${day}<div class="msg ${head ? 'head' : ''}" data-mid="${m.id}">
     <div class="gutter">${head ? avatarHtml(user) : `<time>${fmtTime(m.created_at)}</time>`}</div>
@@ -555,12 +602,12 @@ function messageHtml(m, prev) {
 }
 function renderMessages(toBottom) {
   const box = $('#messages'); if (!box) return;
-  const c = chan(); const list = S.messages[c.id] || [];
+  const t = threadFor(); if (!t) return;
+  const list = S.messages[t.id] || [];
   const prevH = box.scrollHeight, prevTop = box.scrollTop;
   box.innerHTML = `
-    ${S.hasMore[c.id] ? '<button class="btn ghost load-more" id="load-more">Carregar mensagens anteriores</button>' : `
-    <div class="welcome"><div class="big">${icon('hash')}</div><h2>Bem-vindo a #${esc(c.name)}!</h2><p>Este é o começo do canal #${esc(c.name)}.</p></div>`}
-    ${list.map((m, i) => messageHtml(m, list[i - 1])).join('')}`;
+    ${S.hasMore[t.id] ? '<button class="btn ghost load-more" id="load-more">Carregar mensagens anteriores</button>' : t.welcome}
+    ${list.map((m, i) => messageHtml(m, list[i - 1], t)).join('')}`;
   bindMessageActions(box);
   $('#load-more')?.addEventListener('click', loadOlder);
   if (toBottom) box.scrollTop = box.scrollHeight;
@@ -568,28 +615,79 @@ function renderMessages(toBottom) {
 }
 function appendMessage(m) {
   const box = $('#messages'); if (!box) return;
-  const list = S.messages[m.channel_id];
+  const t = threadFor(); if (!t) return;
+  const list = S.messages[t.id];
   const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 150 || m.author_id === S.me.id;
-  box.insertAdjacentHTML('beforeend', messageHtml(m, list[list.length - 2]));
+  box.insertAdjacentHTML('beforeend', messageHtml(m, list[list.length - 2], t));
   bindMessageActions(box);
   if (nearBottom) box.scrollTop = box.scrollHeight;
 }
 function bindMessageActions(box) {
   $$('[data-del]', box).forEach((b) => {
     b.onclick = async () => {
+      const t = threadFor(); if (!t) return;
       if (!confirm('Excluir esta mensagem?')) return;
-      try { await api(`/api/messages/${b.dataset.del}`, { method: 'DELETE' }); } catch (e) { toast(e.message, true); }
+      try { await api(t.delUrl(b.dataset.del), { method: 'DELETE' }); } catch (e) { toast(e.message, true); }
     };
   });
 }
 async function loadOlder() {
-  const c = chan(); const list = S.messages[c.id];
+  const t = threadFor(); if (!t) return;
+  const list = S.messages[t.id];
   try {
-    const older = await api(`/api/channels/${c.id}/messages?before=${encodeURIComponent(list[0]?.created_at || '')}`);
-    S.hasMore[c.id] = older.length >= 50;
-    S.messages[c.id] = [...older, ...list];
+    const older = await api(`${t.base}?before=${encodeURIComponent(list[0]?.created_at || '')}`);
+    S.hasMore[t.id] = older.length >= 50;
+    S.messages[t.id] = [...older, ...list];
     renderMessages(false);
   } catch (e) { toast(e.message, true); }
+}
+
+// ---------------------------------------------------------------- conversas privadas
+function upsertDm(d) {
+  const i = S.dms.findIndex((x) => x.id === d.id);
+  if (i >= 0) S.dms[i] = { ...S.dms[i], ...d }; else S.dms.push(d);
+  S.dms.sort((a, b) => (b.last_at > a.last_at ? 1 : -1));
+}
+async function openDm(userId) {
+  try {
+    const d = await api('/api/dms', { method: 'POST', body: { user_id: userId } });
+    upsertDm(d);
+    closeModal(); $('.menu')?.remove();
+    setNav(false);
+    navigate(`/dm/${d.id}`);
+  } catch (e) { toast(e.message, true); }
+}
+const totalUnread = () => S.dms.reduce((n, d) => n + (d.unread || 0), 0);
+function renderHomeSidebar() {
+  return `<div class="sidebar-head"><div class="server-name-btn" style="cursor:default"><span class="n">Conversas</span></div>
+      <button class="icon-btn" id="dm-new" title="Nova conversa">${icon('plus')}</button></div>
+    <div class="channels">
+      <button class="channel ${!S.dmId ? 'active' : ''}" data-go="/">${icon('users')}<span class="n">Amigos e servidores</span></button>
+      <div class="cat"><span class="cat-name" style="cursor:default"><span>Mensagens diretas</span></span></div>
+      ${S.dms.length ? S.dms.map((d) => `
+        <button class="channel dm-row ${d.id === S.dmId ? 'active' : ''}" data-go="/dm/${d.id}">
+          <span style="position:relative">${avatarHtml(d.user, 'sm')}<span class="dot sm ${d.user.online ? 'on' : ''}"></span></span>
+          <span class="n"><span class="dm-name">${esc(d.user.display_name)}</span>${d.last_message ? `<small>${d.last_message.mine ? 'Você: ' : ''}${esc(d.last_message.content)}</small>` : ''}</span>
+          ${d.unread ? `<span class="unread">${d.unread > 99 ? '99+' : d.unread}</span>` : ''}
+        </button>`).join('') : '<p class="hint" style="padding:6px 8px">Nenhuma conversa ainda. Clique em + para começar.</p>'}
+    </div>`;
+}
+async function newDmDialog() {
+  const m = openModal(`<h2>Nova conversa</h2><p class="sub">Converse no privado com quem está nos mesmos servidores que você.</p>
+    <input class="input" id="dm-q" placeholder="Buscar pelo nome"><div class="people" id="dm-list"><div class="spinner" style="margin:16px auto"></div></div>`);
+  let people = [];
+  const draw = () => {
+    const q = $('#dm-q', m).value.trim().toLowerCase();
+    const list = people.filter((p) => p.display_name.toLowerCase().includes(q));
+    $('#dm-list', m).innerHTML = list.length ? list.map((p) => `
+      <button class="member-row person" data-dm="${p.id}"><span style="position:relative">${avatarHtml(p)}<span class="dot ${p.online ? 'on' : ''}"></span></span>
+        <div class="nm"><b>${esc(p.display_name)}</b><small>${p.online ? 'Online' : 'Offline'}</small></div>${icon('send')}</button>`).join('')
+      : `<p class="hint" style="padding:12px 4px">${people.length ? 'Ninguém com esse nome.' : 'Você ainda não está em servidores com outras pessoas. Convide amigos para um servidor primeiro.'}</p>`;
+    $$('[data-dm]', m).forEach((b) => { b.onclick = () => openDm(b.dataset.dm); });
+  };
+  $('#dm-q', m).oninput = draw;
+  try { people = await api('/api/people'); } catch (e) { toast(e.message, true); }
+  draw();
 }
 
 // =============================================================== chamadas (WebRTC)
@@ -660,11 +758,13 @@ async function joinCall(cid) {
   if (!audioCtx) { try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch { /* sem análise de fala */ } }
   audioCtx?.resume?.();
   if (audioTrack) watchSpeaking('local', new MediaStream([audioTrack]));
+  applyMic();
+  if (KEYS.ptt.on) toast(`Apertar para falar ligado: segure ${codeLabel(KEYS.ptt.code)} para falar.`);
   socket.emit('voice:join', cid, (res) => {
     if (!res || res.error) { toast(res?.error || 'Não foi possível entrar.', true); return leaveCall(true); }
     if (res.listen_only) {
       call.listenOnly = true; call.muted = true;
-      if (call.audioTrack) call.audioTrack.enabled = false;
+      applyMic();
       toast('Neste canal só a Staff fala — você entrou para ouvir e assistir.');
       renderControls(); renderSidebar();
     }
@@ -789,6 +889,7 @@ function toggleMute() {
       if (!call) return;
       call.audioTrack = st.getAudioTracks()[0];
       call.muted = false;
+      applyMic();
       call.peers.forEach(applyTracks);
       watchSpeaking('local', new MediaStream([call.audioTrack]));
       socket.emit('voice:update', { muted: false });
@@ -797,7 +898,7 @@ function toggleMute() {
   }
   call.muted = !call.muted;
   if (call.deafened && !call.muted) { call.deafened = false; applyDeafen(); }
-  call.audioTrack.enabled = !call.muted;
+  applyMic();
   socket.emit('voice:update', { muted: call.muted, deafened: call.deafened });
   renderControls(); renderSidebar();
 }
@@ -806,8 +907,9 @@ function toggleDeafen() {
   if (!call) return;
   call.deafened = !call.deafened;
   applyDeafen();
-  if (call.deafened && call.audioTrack) { call.muted = true; call.audioTrack.enabled = false; }
-  if (!call.deafened && call.audioTrack && !call.listenOnly) { call.muted = false; call.audioTrack.enabled = true; }
+  if (call.deafened && call.audioTrack) call.muted = true;
+  if (!call.deafened && call.audioTrack && !call.listenOnly) call.muted = false;
+  applyMic();
   socket.emit('voice:update', { muted: call.muted, deafened: call.deafened });
   renderControls(); renderSidebar();
 }
@@ -981,6 +1083,7 @@ function createServerDialog() {
       <div class="field"><label>Cor</label>${colorGrid(st.color)}</div>
       <div class="field"><label>Começar com</label>
         <button type="button" class="kind-opt" data-t="streamer">${icon('sparkle')}<span><b>Modelo streamer</b><small>Cargos, regras, canais de clipes, jogos, voz e área da Staff prontos</small></span></button>
+        <button type="button" class="kind-opt" data-t="ai">${icon('sparkle')}<span><b>Montar com IA</b><small>Descreva do seu jeito e a IA cria tudo</small></span></button>
         <button type="button" class="kind-opt" data-t="blank">${icon('hash')}<span><b>Em branco</b><small>Só #geral e uma sala de voz</small></span></button></div>
       <div class="error-text" id="cs-err"></div>
       <div class="foot"><button type="button" class="btn ghost" id="cs-cancel">Cancelar</button><button class="btn primary">Criar servidor</button></div>
@@ -992,7 +1095,7 @@ function createServerDialog() {
   $('#cs-up', m).onclick = async () => { const u = await pickImage(); if (u) { st.icon_url = u; prev(); } };
   const tsel = () => $$('[data-t]', m).forEach((b) => b.classList.toggle('sel', b.dataset.t === st.template));
   tsel();
-  $$('[data-t]', m).forEach((b) => { b.onclick = () => { st.template = b.dataset.t; tsel(); }; });
+  $$('[data-t]', m).forEach((b) => { b.onclick = () => { if (b.dataset.t === 'ai') { closeModal(); return aiBuildDialog(); } st.template = b.dataset.t; tsel(); }; });
   $('#cs-cancel', m).onclick = closeModal;
   $('#cs-form', m).onsubmit = async (e) => {
     e.preventDefault();
@@ -1208,7 +1311,7 @@ function serverMenu(anchor) {
     ${canSettings ? `<button data-a="settings">Configurações do servidor ${icon('settings')}</button>` : ''}
     ${p.manage_roles ? `<button data-a="roles">Cargos ${icon('shield')}</button>` : ''}
     ${p.manage_channels ? `<button data-a="text">Criar canal ${icon('hash')}</button><button data-a="category">Criar categoria ${icon('folder')}</button>` : ''}
-    ${s.is_owner ? `<button data-a="template">Aplicar modelo streamer ${icon('sparkle')}</button>` : ''}
+    ${s.is_owner ? `<button data-a="ai">Montar com IA ${icon('sparkle')}</button><button data-a="template">Aplicar modelo streamer ${icon('folder')}</button>` : ''}
     <button data-a="members">Membros ${icon('users')}</button>
     <hr>
     ${s.is_owner ? `<button data-a="delete" class="red">Excluir servidor ${icon('trash')}</button>` : `<button data-a="leave" class="red">Sair do servidor ${icon('door')}</button>`}`;
@@ -1226,6 +1329,7 @@ function serverMenu(anchor) {
     if (a === 'text') createChannelDialog('text');
     if (a === 'category') categoryDialog();
     if (a === 'template') serverSettings('template');
+    if (a === 'ai') aiBuildDialog({ existing: true });
     if (a === 'delete') deleteServer();
     if (a === 'leave') {
       if (!confirm(`Sair de "${s.name}"?`)) return;
@@ -1378,9 +1482,11 @@ async function ssMembers(el) {
         <div class="nm"><b style="color:${safeColor(u.color) || 'inherit'}">${esc(u.display_name)}</b> ${u.is_owner ? '<span class="badge">DONO</span>' : ''}
           <div class="chips">${rl.filter((r) => u.role_ids.includes(r.id)).map((r) => `<span class="chip"><span class="role-dot" style="background:${safeColor(r.color) || '#99aab5'}"></span>${esc(r.name)}</span>`).join('')}</div>
           <small>${u.online ? 'Online' : 'Offline'} · entrou em ${new Date(u.joined_at).toLocaleDateString('pt-BR')}</small></div>
+        ${u.id !== S.me.id ? `<button class="icon-btn" data-msg="${u.id}" title="Mandar mensagem">${icon('chat')}</button>` : ''}
         ${p.manage_roles && rl.length ? `<button class="btn ghost" data-roles="${u.id}">Cargos</button>` : ''}
         ${p.kick && !u.is_owner && u.id !== S.me.id ? `<button class="btn danger" data-kick="${u.id}" data-name="${esc(u.display_name)}">Remover</button>` : ''}
       </div>`).join('')}`;
+    $$('[data-msg]', el).forEach((b) => { b.onclick = () => openDm(b.dataset.msg); });
     $$('[data-kick]', el).forEach((b) => {
       b.onclick = async () => {
         if (!confirm(`Remover ${b.dataset.name} do servidor?`)) return;
@@ -1452,16 +1558,17 @@ function userSettings(tab = 'profile') {
   const cleanup = [];
   const m = openModal(`
     <nav class="settings-nav"><h4>Configurações</h4>
-      <button data-tab="profile">Perfil</button><button data-tab="call">Voz e vídeo</button><button data-tab="account">Conta</button>
+      <button data-tab="profile">Perfil</button><button data-tab="call">Voz e vídeo</button><button data-tab="keys">Atalhos</button><button data-tab="account">Conta</button>
       <button class="red" data-tab="logout">Sair</button></nav>
     <section class="settings-body"><button class="icon-btn close" id="us-close">${icon('x')}</button><div id="us-body"></div></section>`,
-  { wide: true, onClose: () => cleanup.splice(0).forEach((f) => f()) });
+  { wide: true, onClose: () => { capturing = null; cleanup.splice(0).forEach((f) => f()); } });
   $('#us-close', m).onclick = closeModal;
   const show = (t) => {
     if (t === 'logout') { closeModal(); return logout(); }
     cleanup.splice(0).forEach((f) => f());
     $$('[data-tab]', m).forEach((b) => b.classList.toggle('active', b.dataset.tab === t));
-    ({ profile: usProfile, call: usCall, account: usAccount })[t]($('#us-body', m), cleanup);
+    capturing = null;
+    ({ profile: usProfile, call: usCall, keys: usKeys, account: usAccount })[t]($('#us-body', m), cleanup);
   };
   $$('[data-tab]', m).forEach((b) => { b.onclick = () => show(b.dataset.tab); });
   show(tab);
@@ -1560,6 +1667,295 @@ function usAccount(el) {
     e.preventDefault(); $('#pw-err', el).textContent = '';
     try { await api('/api/me/password', { method: 'POST', body: Object.fromEntries(new FormData(e.target)) }); e.target.reset(); toast('Senha alterada.'); }
     catch (err) { $('#pw-err', el).textContent = err.message; }
+  };
+}
+
+// =============================================================== IA que monta o servidor
+const AI_EXAMPLES = [
+  'Comunidade do meu canal de YouTube de gameplay, com lives, clipes e sorteios',
+  'Servidor de GTA RP com polícia, hospital, empregos e staff',
+  'Clã de Free Fire com treinos, campeonatos e escalação',
+  'Servidor de amigos para jogar Valorant e Minecraft e ouvir música',
+];
+function planPreviewHtml(plan) {
+  return `<div class="tpl">
+    <div><h4>Cargos</h4><p>${plan.roles.map((r) => `<span class="chip"><span class="role-dot" style="background:${safeColor(r.color) || '#99aab5'}"></span>${esc(r.name)}${r.default ? ' <small>(automático)</small>' : ''}</span>`).join(' ')}</p></div>
+    ${plan.categories.map((c) => `<div><h4>${esc(c.name)}${c.private ? ' <small>privado</small>' : ''}</h4><p>${c.channels.map((ch) => `${ch.kind === 'voice' ? '🔊' : '#'}${esc(ch.name)}${ch.read_only ? '<small> (só leitura)</small>' : ''}`).join(' · ')}</p></div>`).join('')}
+    ${plan.rules ? `<div><h4>Regras</h4><p style="white-space:pre-wrap">${esc(plan.rules)}</p></div>` : ''}
+  </div>`;
+}
+async function aiBuildDialog(opts = {}) {
+  const existing = opts.existing ? current() : null;
+  let plan = null;
+  const m = openModal(`
+    <h2>${icon('sparkle')} Montar servidor com IA</h2>
+    <p class="sub">${existing ? `Descreva como você quer o <b>${esc(existing.name)}</b>` : 'Descreva o servidor dos seus sonhos'} e a IA cria cargos, categorias, canais e regras do seu jeito.</p>
+    <div id="ai-step1">
+      ${existing ? '' : `<div class="field"><label>Nome do servidor</label><input class="input" id="ai-name" maxlength="40" value="${esc(`Servidor de ${S.me.display_name}`)}"></div>`}
+      <div class="field"><label>Como você quer o servidor?</label><textarea class="input" id="ai-prompt" rows="4" maxlength="1500" style="height:auto;padding:10px 12px;resize:vertical" placeholder="Ex.: servidor pro meu canal de gameplay, com área de clipes, sorteios, canal de GTA RP e Free Fire, staff e sala de live"></textarea></div>
+      <div class="ai-chips">${AI_EXAMPLES.map((x) => `<button type="button" class="chip-btn" data-ex="${esc(x)}">${esc(x)}</button>`).join('')}</div>
+      <div class="switch"><span>Usar emojis nos nomes</span><input type="checkbox" id="ai-emoji" checked></div>
+      ${existing ? `<div class="switch"><span>Apagar canais, categorias e cargos atuais antes <small class="hint" style="display:block">As mensagens desses canais também são apagadas.</small></span><input type="checkbox" id="ai-replace"></div>` : ''}
+      <div class="error-text" id="ai-err" style="margin-top:12px"></div>
+      <div class="foot"><button class="btn ghost" id="ai-cancel">Cancelar</button><button class="btn primary" id="ai-go">${icon('sparkle')}Gerar</button></div>
+    </div>
+    <div id="ai-step2" class="hidden">
+      <p class="hint" id="ai-source" style="margin:0 0 10px"></p>
+      <div id="ai-preview" style="max-height:48vh;overflow:auto"></div>
+      <div class="error-text" id="ai-err2" style="margin-top:10px"></div>
+      <div class="foot" style="justify-content:space-between"><button class="btn ghost" id="ai-back">Voltar e mudar</button>
+        <span style="display:flex;gap:8px"><button class="btn" id="ai-again">Gerar de novo</button><button class="btn primary" id="ai-apply">${existing ? 'Aplicar no servidor' : 'Criar servidor'}</button></span></div>
+    </div>`);
+  m.style.maxWidth = '600px';
+  $('#ai-cancel', m).onclick = closeModal;
+  $$('[data-ex]', m).forEach((b) => { b.onclick = () => { $('#ai-prompt', m).value = b.dataset.ex; }; });
+  const generate = async (btn) => {
+    const prompt = $('#ai-prompt', m).value.trim();
+    if (prompt.length < 4) { $('#ai-err', m).textContent = 'Escreva como você quer o servidor (ou clique num exemplo).'; return; }
+    btn.disabled = true; const old = btn.innerHTML; btn.innerHTML = '<span class="spinner sm"></span>Gerando…';
+    $('#ai-err', m).textContent = ''; $('#ai-err2', m).textContent = '';
+    try {
+      const r = await api('/api/ai/plan', { method: 'POST', body: { prompt, emoji: $('#ai-emoji', m).checked } });
+      plan = r.plan;
+      $('#ai-source', m).innerHTML = r.source === 'local'
+        ? `${r.warning ? esc(r.warning) + ' ' : ''}Feito pelo <b>assistente básico</b> (sem chave de IA configurada no servidor).`
+        : `Feito pela IA <b>${esc(r.source)}</b>. Não gostou? Gere de novo ou mude o pedido.`;
+      $('#ai-preview', m).innerHTML = planPreviewHtml(plan);
+      $('#ai-step1', m).classList.add('hidden'); $('#ai-step2', m).classList.remove('hidden');
+    } catch (err) { ($('#ai-step2', m).classList.contains('hidden') ? $('#ai-err', m) : $('#ai-err2', m)).textContent = err.message; }
+    btn.disabled = false; btn.innerHTML = old;
+  };
+  $('#ai-go', m).onclick = (e) => generate(e.currentTarget);
+  $('#ai-again', m).onclick = (e) => generate(e.currentTarget);
+  $('#ai-back', m).onclick = () => { $('#ai-step2', m).classList.add('hidden'); $('#ai-step1', m).classList.remove('hidden'); };
+  $('#ai-apply', m).onclick = async (e) => {
+    const btn = e.currentTarget; btn.disabled = true;
+    try {
+      if (existing) {
+        const replace = $('#ai-replace', m)?.checked;
+        if (replace && !confirm('Apagar TODOS os canais, categorias e cargos atuais e montar o novo servidor?')) { btn.disabled = false; return; }
+        const r = await api(`/api/servers/${existing.id}/apply-plan`, { method: 'POST', body: { plan, replace } });
+        closeModal();
+        toast(`Pronto! ${r.roles} cargos, ${r.categories} categorias e ${r.channels} canais criados.`);
+      } else {
+        const name = $('#ai-name', m).value.trim() || `Servidor de ${S.me.display_name}`;
+        const s = await api('/api/servers', { method: 'POST', body: { name, plan } });
+        S.servers.push(s);
+        closeModal();
+        navigate(`/s/${s.id}`);
+        toast('Servidor criado pela IA!');
+      }
+    } catch (err) { $('#ai-err2', m).textContent = err.message; btn.disabled = false; }
+  };
+}
+
+// =============================================================== teclas de atalho
+const SHORTCUTS = [
+  ['quick', 'Busca rápida (servidores, canais e conversas)', 'Ctrl+K'],
+  ['mute', 'Silenciar / ativar microfone', 'Ctrl+Alt+M'],
+  ['deafen', 'Desativar / ativar áudio', 'Ctrl+Alt+D'],
+  ['camera', 'Ligar / desligar câmera', 'Ctrl+Alt+C'],
+  ['screen', 'Compartilhar tela', 'Ctrl+Alt+S'],
+  ['fullscreen', 'Tela cheia da transmissão', 'Ctrl+Alt+F'],
+  ['leave', 'Sair da chamada', 'Ctrl+Alt+L'],
+  ['prevChannel', 'Canal anterior', 'Alt+ArrowUp'],
+  ['nextChannel', 'Próximo canal', 'Alt+ArrowDown'],
+  ['prevServer', 'Servidor anterior', 'Ctrl+Alt+ArrowUp'],
+  ['nextServer', 'Próximo servidor', 'Ctrl+Alt+ArrowDown'],
+  ['dms', 'Abrir conversas', 'Ctrl+Alt+H'],
+  ['newDm', 'Nova conversa', 'Ctrl+Alt+N'],
+  ['settings', 'Configurações', 'Ctrl+Alt+,'],
+];
+function loadKeys() {
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem('gp_keys') || '{}'); } catch { /* ignora */ }
+  const map = {};
+  SHORTCUTS.forEach(([k, , def]) => { map[k] = saved[k] !== undefined ? saved[k] : def; });
+  map.ptt = saved.ptt || { on: false, code: 'F8' };
+  return map;
+}
+let KEYS = loadKeys();
+function saveKeys() { try { localStorage.setItem('gp_keys', JSON.stringify(KEYS)); } catch { /* ignora */ } }
+function comboOf(e) {
+  let k;
+  if (/^Key[A-Z]$/.test(e.code)) k = e.code.slice(3);
+  else if (/^Digit\d$/.test(e.code)) k = e.code.slice(5);
+  else if (e.code === 'Comma') k = ',';
+  else if (e.code === 'Period') k = '.';
+  else if (['Control', 'Alt', 'Shift', 'Meta', 'AltGraph'].includes(e.key)) return '';
+  else k = e.key.length === 1 ? e.key.toUpperCase() : e.key;
+  return [(e.ctrlKey || e.metaKey) && 'Ctrl', e.altKey && 'Alt', e.shiftKey && 'Shift', k].filter(Boolean).join('+');
+}
+const KEY_NAMES = { ArrowUp: '↑', ArrowDown: '↓', ArrowLeft: '←', ArrowRight: '→', ' ': 'Espaço', Escape: 'Esc' };
+const keyLabel = (combo) => (combo ? combo.split('+').map((p) => `<kbd>${esc(KEY_NAMES[p] || p)}</kbd>`).join('<span class="plus">+</span>') : '<span class="hint">sem atalho</span>');
+const codeLabel = (code) => (code || '').replace(/^Key/, '').replace(/^Digit/, '').replace('Backquote', "'") || '—';
+const isTyping = (el) => el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT' || el.isContentEditable);
+
+function navOrder() {
+  const s = current(); if (!s) return [];
+  const chs = S.channels[s.id] || [];
+  const known = new Set((s.categories || []).map((c) => c.id));
+  return [...chs.filter((c) => !known.has(c.category_id)), ...(s.categories || []).flatMap((cat) => chs.filter((c) => c.category_id === cat.id))];
+}
+function stepChannel(dir) {
+  if (!S.serverId) {
+    const list = S.dms; if (!list.length) return;
+    const i = list.findIndex((d) => d.id === S.dmId);
+    const n = list[(i + dir + list.length) % list.length];
+    return navigate(`/dm/${n.id}`);
+  }
+  const list = navOrder(); if (!list.length) return;
+  const i = list.findIndex((c) => c.id === S.channelId);
+  const n = list[(i + dir + list.length) % list.length];
+  navigate(`/s/${S.serverId}/${n.id}`);
+}
+function stepServer(dir) {
+  const ids = [null, ...S.servers.map((s) => s.id)];
+  const i = ids.indexOf(S.serverId);
+  const n = ids[(i + dir + ids.length) % ids.length];
+  navigate(n ? `/s/${n}` : '/');
+}
+const ACTIONS = {
+  quick: () => quickSwitcher(),
+  mute: () => (call ? toggleMute() : toast('Você não está em uma chamada.')),
+  deafen: () => (call ? toggleDeafen() : toast('Você não está em uma chamada.')),
+  camera: () => (call ? toggleCamera() : toast('Você não está em uma chamada.')),
+  screen: () => (call ? toggleScreen() : toast('Você não está em uma chamada.')),
+  leave: () => call && leaveCall(),
+  fullscreen: () => {
+    if (!call) return;
+    if (call.focusKey) return exitFocus();
+    const parts = S.voice[call.channelId] || [];
+    const sharer = parts.find((p) => p.screen && p.socket_id !== socket.id) || parts.find((p) => p.screen);
+    const k = sharer ? sharer.socket_id + ':s' : $('#call-grid .tile')?.dataset.key;
+    if (S.channelId !== call.channelId) navigate(`/s/${call.serverId}/${call.channelId}`);
+    if (k) setTimeout(() => enterFocus(k), 50);
+  },
+  prevChannel: () => stepChannel(-1),
+  nextChannel: () => stepChannel(1),
+  prevServer: () => stepServer(-1),
+  nextServer: () => stepServer(1),
+  dms: () => navigate('/'),
+  newDm: () => newDmDialog(),
+  settings: () => userSettings('profile'),
+};
+
+// apertar para falar
+function applyMic() {
+  if (!call?.audioTrack) return;
+  const ptt = KEYS.ptt.on && !call.listenOnly;
+  call.audioTrack.enabled = !call.muted && !call.listenOnly && (!ptt || !!call.pttDown);
+}
+function setPtt(down) {
+  if (!call || !KEYS.ptt.on || call.pttDown === down) return;
+  call.pttDown = down;
+  applyMic();
+  document.body.classList.toggle('ptt-live', down && !call.muted);
+}
+window.addEventListener('blur', () => setPtt(false));
+
+let capturing = null;
+document.addEventListener('keydown', (e) => {
+  if (!S.me) return;
+  if (capturing) { e.preventDefault(); e.stopPropagation(); capturing(e); return; }
+  if (KEYS.ptt.on && e.code === KEYS.ptt.code && !isTyping(e.target)) { e.preventDefault(); if (!e.repeat) setPtt(true); return; }
+  const combo = comboOf(e);
+  if (!combo) return;
+  const typing = isTyping(e.target);
+  if (combo === 'Shift+?' || combo === '?') { if (!typing) { e.preventDefault(); shortcutsHelp(); } return; }
+  const action = Object.keys(ACTIONS).find((k) => KEYS[k] && KEYS[k] === combo);
+  if (action) {
+    if (typing && !/Ctrl|Alt/.test(combo)) return;
+    if ($('#modal-root').innerHTML && !['quick', 'mute', 'deafen'].includes(action)) closeModal();
+    e.preventDefault();
+    ACTIONS[action]();
+    return;
+  }
+  // começar a digitar em qualquer lugar vai para a caixa de mensagem
+  if (!typing && !e.ctrlKey && !e.altKey && !e.metaKey && e.key.length === 1 && !$('#modal-root').innerHTML) $('#msg-input')?.focus();
+}, true);
+document.addEventListener('keyup', (e) => { if (KEYS.ptt.on && e.code === KEYS.ptt.code) setPtt(false); }, true);
+
+function shortcutsHelp() {
+  const m = openModal(`<h2>Teclas de atalho</h2><p class="sub">Funcionam com o GlobalPath aberto e em foco. Mude as teclas em Configurações → Atalhos.</p>
+    <div class="keys-list">
+      ${SHORTCUTS.map(([k, label]) => `<div class="key-row"><span>${label}</span><span>${keyLabel(KEYS[k])}</span></div>`).join('')}
+      <div class="key-row"><span>Apertar para falar ${KEYS.ptt.on ? '' : '<small class="hint">(desligado)</small>'}</span><span><kbd>${esc(codeLabel(KEYS.ptt.code))}</kbd></span></div>
+      <div class="key-row"><span>Mostrar esta lista</span><span><kbd>?</kbd></span></div>
+      <div class="key-row"><span>Fechar janelas / sair da tela cheia</span><span><kbd>Esc</kbd></span></div>
+      <div class="key-row"><span>Enviar mensagem · nova linha</span><span><kbd>Enter</kbd> · <kbd>Shift</kbd><span class="plus">+</span><kbd>Enter</kbd></span></div>
+    </div>
+    <div class="foot"><button class="btn" id="kh-edit">Mudar atalhos</button><button class="btn primary" id="kh-ok">Fechar</button></div>`);
+  $('#kh-ok', m).onclick = closeModal;
+  $('#kh-edit', m).onclick = () => userSettings('keys');
+}
+
+function quickSwitcher() {
+  const items = [
+    ...S.servers.map((s) => ({ label: s.name, sub: 'Servidor', go: `/s/${s.id}`, icon: serverIconHtml(s, 'mini-icon') })),
+    ...S.servers.flatMap((s) => (S.channels[s.id] || []).map((c) => ({ label: c.name, sub: s.name, go: `/s/${s.id}/${c.id}`, icon: icon(c.kind === 'voice' ? 'volume' : 'hash') }))),
+    ...S.dms.map((d) => ({ label: d.user.display_name, sub: 'Conversa', go: `/dm/${d.id}`, icon: avatarHtml(d.user, 'sm') })),
+  ];
+  let sel = 0, shown = [];
+  const m = openModal(`<input class="input qs-input" id="qs" placeholder="Para onde você quer ir?" autocomplete="off"><div class="qs-list" id="qs-list"></div>
+    <p class="hint" style="margin:10px 0 0"><kbd>↑</kbd> <kbd>↓</kbd> para escolher · <kbd>Enter</kbd> para ir · <kbd>Esc</kbd> para fechar</p>`);
+  const inp = $('#qs', m);
+  setTimeout(() => inp.focus(), 20);
+  const draw = () => {
+    const q = inp.value.trim().toLowerCase();
+    shown = items.filter((i) => !q || i.label.toLowerCase().includes(q) || i.sub.toLowerCase().includes(q)).slice(0, 12);
+    sel = Math.min(sel, Math.max(0, shown.length - 1));
+    $('#qs-list', m).innerHTML = shown.map((i, n) => `<button class="qs-item ${n === sel ? 'sel' : ''}" data-n="${n}">${i.icon}<span>${esc(i.label)}</span><small>${esc(i.sub)}</small></button>`).join('') || '<p class="hint" style="padding:10px">Nada encontrado.</p>';
+    $$('[data-n]', m).forEach((b) => { b.onclick = () => go(shown[+b.dataset.n]); });
+  };
+  const go = (i) => { if (!i) return; closeModal(); setNav(false); navigate(i.go); };
+  inp.oninput = () => { sel = 0; draw(); };
+  inp.onkeydown = (e) => {
+    if (e.key === 'ArrowDown') { e.preventDefault(); sel = (sel + 1) % Math.max(1, shown.length); draw(); }
+    if (e.key === 'ArrowUp') { e.preventDefault(); sel = (sel - 1 + shown.length) % Math.max(1, shown.length); draw(); }
+    if (e.key === 'Enter') { e.preventDefault(); go(shown[sel]); }
+  };
+  draw();
+}
+
+function usKeys(el) {
+  el.innerHTML = `<h3>Teclas de atalho</h3>
+    <p class="hint" style="margin:-8px 0 14px">Clique num atalho e aperte as teclas novas. <kbd>Backspace</kbd> apaga, <kbd>Esc</kbd> cancela. Os atalhos funcionam com o site aberto e em foco.</p>
+    <div class="keys-list">${SHORTCUTS.map(([k, label]) => `<div class="key-row"><span>${label}</span><button class="key-btn" data-key="${k}">${keyLabel(KEYS[k])}</button></div>`).join('')}</div>
+    <h4 class="perm-title">Apertar para falar</h4>
+    <div class="switch"><span>Ligar "apertar para falar"<small class="hint" style="display:block">Seu microfone só transmite enquanto você segura a tecla.</small></span><input type="checkbox" id="ptt-on" ${KEYS.ptt.on ? 'checked' : ''}></div>
+    <div class="key-row" style="margin-top:8px"><span>Tecla</span><button class="key-btn" id="ptt-key"><kbd>${esc(codeLabel(KEYS.ptt.code))}</kbd></button></div>
+    <div class="foot" style="justify-content:flex-start"><button class="btn ghost" id="keys-reset">Voltar ao padrão</button></div>`;
+  const stopCapture = () => { capturing = null; $$('.key-btn', el).forEach((b) => b.classList.remove('rec')); };
+  $$('[data-key]', el).forEach((b) => {
+    b.onclick = () => {
+      stopCapture();
+      b.classList.add('rec'); b.innerHTML = 'Aperte as teclas…';
+      capturing = (e) => {
+        if (e.key === 'Escape') { stopCapture(); return usKeys(el); }
+        if (e.key === 'Backspace' || e.key === 'Delete') { KEYS[b.dataset.key] = ''; saveKeys(); stopCapture(); return usKeys(el); }
+        const c = comboOf(e); if (!c) return;
+        if (!/Ctrl|Alt/.test(c)) { b.innerHTML = 'Use Ctrl ou Alt junto'; return; }
+        const clash = SHORTCUTS.find(([k]) => k !== b.dataset.key && KEYS[k] === c);
+        if (clash) KEYS[clash[0]] = '';
+        KEYS[b.dataset.key] = c; saveKeys(); stopCapture(); usKeys(el);
+        if (clash) toast(`"${clash[1]}" ficou sem atalho.`);
+      };
+    };
+  });
+  $('#ptt-on', el).onchange = (e) => { KEYS.ptt.on = e.target.checked; saveKeys(); if (call) { call.pttDown = false; applyMic(); } };
+  $('#ptt-key', el).onclick = (ev) => {
+    stopCapture();
+    const b = ev.currentTarget; b.classList.add('rec'); b.innerHTML = 'Aperte uma tecla…';
+    capturing = (e) => {
+      if (e.key === 'Escape') { stopCapture(); return usKeys(el); }
+      KEYS.ptt.code = e.code; saveKeys(); stopCapture(); usKeys(el);
+    };
+  };
+  $('#keys-reset', el).onclick = () => {
+    const ptt = KEYS.ptt;
+    try { localStorage.removeItem('gp_keys'); } catch { /* ignora */ }
+    KEYS = loadKeys(); KEYS.ptt = ptt; saveKeys(); usKeys(el); toast('Atalhos restaurados.');
   };
 }
 
