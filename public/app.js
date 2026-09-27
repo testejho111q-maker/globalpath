@@ -45,6 +45,10 @@ const ICONS = {
   mail: '<rect x="2" y="4" width="20" height="16" rx="2"/><path d="m22 7-10 6L2 7"/>',
   check: '<path d="M20 6 9 17l-5-5"/>',
   userMinus: '<path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><path d="M23 11h-6"/>',
+  phone: '<path d="M22 16.9v3a2 2 0 0 1-2.2 2 19.8 19.8 0 0 1-8.6-3.1 19.5 19.5 0 0 1-6-6A19.8 19.8 0 0 1 2.1 4.2 2 2 0 0 1 4.1 2h3a2 2 0 0 1 2 1.7c.1.9.3 1.8.6 2.7a2 2 0 0 1-.4 2.1L8 9.8a16 16 0 0 0 6 6l1.3-1.3a2 2 0 0 1 2.1-.4c.9.3 1.8.5 2.7.6a2 2 0 0 1 1.7 2z"/>',
+  more: '<circle cx="12" cy="5" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="12" cy="19" r="1.5"/>',
+  block: '<circle cx="12" cy="12" r="10"/><path d="m4.9 4.9 14.2 14.2"/>',
+  flag: '<path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1zM4 22v-7"/>',
   radio: '<circle cx="12" cy="12" r="2"/><path d="M16.2 7.8a6 6 0 0 1 0 8.4M7.8 16.2a6 6 0 0 1 0-8.4M19.1 4.9a10 10 0 0 1 0 14.2M4.9 19.1a10 10 0 0 1 0-14.2"/>',
   chat: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
   compass: '<circle cx="12" cy="12" r="10"/><path d="m16.2 7.8-2.1 6.3-6.3 2.1 2.1-6.3z"/>',
@@ -110,12 +114,12 @@ function imageToDataUrl(file, size = 256) {
     img.src = URL.createObjectURL(file);
   });
 }
-function pickImage() {
+function pickImage(size = 256) {
   return new Promise((resolve) => {
     const inp = document.createElement('input');
     inp.type = 'file'; inp.accept = 'image/*';
     inp.onchange = async () => {
-      try { resolve(await imageToDataUrl(inp.files[0])); } catch (e) { toast(e.message, true); resolve(null); }
+      try { resolve(await imageToDataUrl(inp.files[0], size)); } catch (e) { toast(e.message, true); resolve(null); }
     };
     inp.click();
   });
@@ -153,6 +157,8 @@ const S = {
   roles: {},         // sid -> cargos
   dmId: null,
   streamer: false,
+  blocks: [],
+  blockedIds: new Set(),
   friends: { friends: [], incoming: [], outgoing: [] },
   homeView: 'friends',
   friendsTab: 'online',
@@ -228,7 +234,9 @@ function renderAuth(mode = 'login') {
     const body = Object.fromEntries(new FormData(e.target));
     btn.disabled = true; $('#auth-err').textContent = '';
     try {
-      S.me = await api(isLogin ? '/api/auth/login' : '/api/auth/register', { method: 'POST', body });
+      const r = await api(isLogin ? '/api/auth/login' : '/api/auth/register', { method: 'POST', body });
+      if (r.need_2fa) return render2fa(r.ticket);
+      S.me = r;
       await startSession();
     } catch (err) {
       $('#auth-err').textContent = err.message;
@@ -237,7 +245,26 @@ function renderAuth(mode = 'login') {
   };
 }
 
+function render2fa(ticket) {
+  $('#app').innerHTML = `<div class="auth"><form class="auth-card" id="tfa-form">
+    <div class="brand"><img class="brand-logo" src="/logo-192.png" alt=""><span><b>LUMIX</b><small>Verificação em duas etapas</small></span></div>
+    <h1>Digite o código</h1><p class="sub">Abra o app autenticador no celular e digite o código de 6 números. Sem o celular? Use um código de recuperação.</p>
+    <div class="field"><label>Código</label><input class="input" name="code" autocomplete="one-time-code" inputmode="numeric" maxlength="12" autofocus></div>
+    <div class="error-text" id="tfa-err"></div>
+    <button class="btn primary block">Entrar</button>
+    <div class="switch-link"><button type="button" id="tfa-back">Voltar</button></div></form></div>`;
+  $('#tfa-back').onclick = () => renderAuth('login');
+  $('[name=code]').focus();
+  $('#tfa-form').onsubmit = async (e) => {
+    e.preventDefault();
+    const btn = e.target.querySelector('.btn'); btn.disabled = true;
+    try { S.me = await api('/api/auth/2fa', { method: 'POST', body: { ticket, code: e.target.code.value } }); await startSession(); }
+    catch (err) { $('#tfa-err').textContent = err.message; btn.disabled = false; if (/tempo/.test(err.message)) setTimeout(() => renderAuth('login'), 1500); }
+  };
+}
+
 async function startSession() {
+  await loadBlocks();
   [S.servers, S.dms] = await Promise.all([api('/api/servers'), api('/api/dms').catch(() => [])]);
   await loadFriends();
   connectSocket();
@@ -256,7 +283,10 @@ async function logout() {
 // =============================================================== socket
 function connectSocket() {
   socket = io({ transports: ['websocket', 'polling'] });
-  socket.on('connect', () => { if (S.serverId) refreshVoice(S.serverId); });
+  socket.on('connect', () => {
+    if (S.serverId) refreshVoice(S.serverId);
+    socket.emit('voice:dmsnapshot', (snap) => { Object.assign(S.voice, snap); if (!S.serverId && S.dmId) fillDmCallSlot(); });
+  });
   socket.on('connect_error', (e) => { if (e.message === 'unauthorized') logout(); });
 
   socket.on('message:created', (m) => addMessage(m.channel_id, m));
@@ -275,9 +305,13 @@ function connectSocket() {
   });
   socket.on('friends:update', async () => {
     await loadFriends();
+    try { const list = await api('/api/dms'); list.forEach(upsertDm); } catch { /* ignora */ }
     renderRail();
     if (!S.serverId) { renderSidebar(); if (!S.dmId && !(S.homeView === 'friends' && S.friendsTab === 'add' && $('#add-form'))) renderMain(); }
   });
+  socket.on('session:ended', () => { toast('Sua sessão foi encerrada em outro aparelho.', true); setTimeout(() => location.reload(), 1200); });
+  socket.on('blocks:update', () => loadBlocks());
+  socket.on('admin:report', () => toast('🛡️ Nova denúncia para a equipe analisar.'));
   socket.on('friends:request', ({ from, message }) => {
     toast(`👋 ${from.display_name} quer ser seu amigo${message ? `: “${message}”` : ''}`);
   });
@@ -308,10 +342,23 @@ function connectSocket() {
   });
   socket.on('voice:state', ({ channel_id, participants }) => {
     S.voice[channel_id] = participants;
+    if (channel_id.startsWith('dm:')) {
+      const did = channel_id.slice(3);
+      if (call?.channelId === channel_id && participants.length > 1) clearTimeout(call.ringTimer);
+      if (!S.serverId && S.dmId === did) { if (call?.channelId === channel_id) { updateCallGrid(); renderControls(); } else fillDmCallSlot(); }
+      if (!S.serverId) renderSidebar();
+      return;
+    }
     const c = (S.channels[S.serverId] || []).find((x) => x.id === channel_id);
     if (c) renderSidebar();
     if (call && call.channelId === channel_id) { if (S.channelId === channel_id) { updateCallGrid(); renderControls(); } }
     else if (channel_id === S.channelId) renderMain();
+  });
+  socket.on('call:ring', ({ dm_id, from, video }) => showRing(dm_id, from, video));
+  socket.on('call:stop-ring', ({ dm_id }) => stopRing(dm_id));
+  socket.on('call:ended', ({ dm_id }) => { stopRing(dm_id); delete S.voice[`dm:${dm_id}`]; if (!S.serverId && S.dmId === dm_id) fillDmCallSlot(); });
+  socket.on('call:declined', ({ dm_id, by }) => {
+    if (call?.dm === dm_id && (S.voice[`dm:${dm_id}`] || []).length <= 1) { leaveCall(); toast(`${by} recusou a chamada.`); }
   });
   socket.on('voice:left', ({ channel_id }) => {
     if (call && call.channelId === channel_id) leaveCall(true);
@@ -426,7 +473,7 @@ function renderSidebar() {
         ${p.manage_channels ? `<span class="ch-actions"><span class="icon-btn" data-edit-ch="${c.id}" title="Editar canal">${icon('settings')}</span></span>` : ''}
       </button>
       ${c.kind === 'voice' ? `<div class="voice-users">${(S.voice[c.id] || []).map((vp) => `
-        <div class="voice-user" data-sock="${vp.socket_id}">${avatarHtml(vp, 'sm')}<span>${esc(vp.display_name)}</span>
+        <div class="voice-user clickable" data-sock="${vp.socket_id}" data-profile="${vp.user_id}">${avatarHtml(vp, 'sm')}<span>${esc(vp.display_name)}</span>
           <span class="flags">${vp.screen ? '<span class="tag">AO VIVO</span>' : ''}${vp.camera ? icon('video') : ''}${vp.muted ? icon('micOff') : ''}${vp.deafened ? icon('headOff') : ''}</span></div>`).join('')}</div>` : ''}`;
     const catBlock = (cat) => {
       const list = chs.filter((c) => c.category_id === cat.id);
@@ -447,8 +494,9 @@ function renderSidebar() {
         ${!chs.length && !cats.length ? '<p class="hint" style="padding:8px">Nenhum canal ainda.</p>' : ''}
       </div>`;
   }
-  const inCall = call ? (Object.values(S.channels).flat().find((c) => c.id === call.channelId)) : null;
-  const callServer = call ? S.servers.find((x) => x.id === call.serverId) : null;
+  const callDm = call?.dm ? S.dms.find((d) => d.id === call.dm) : null;
+  const inCall = call ? (callDm ? { name: `Chamada com ${callDm.user.display_name}` } : Object.values(S.channels).flat().find((c) => c.id === call.channelId)) : null;
+  const callServer = call ? (callDm ? { name: 'Conversa privada' } : S.servers.find((x) => x.id === call.serverId)) : null;
   el.innerHTML = body + `
     ${inCall ? `<div class="voice-bar"><div class="status">
       <div class="info" id="vb-open">${S.streamer ? '<span class="streamer-tag">MODO STREAMER</span>' : ''}<b>Voz conectada</b><small>${esc(inCall.name)} / ${esc(callServer?.name || '')}</small></div>
@@ -492,19 +540,22 @@ function renderSidebar() {
   $('#ub-deaf')?.addEventListener('click', toggleDeafen);
   $('#ub-streamer')?.addEventListener('click', toggleStreamer);
   $('#vb-leave')?.addEventListener('click', () => leaveCall());
-  $('#vb-open')?.addEventListener('click', () => { setNav(false); navigate(`/s/${call.serverId}/${call.channelId}`); });
+  $('#vb-open')?.addEventListener('click', () => { setNav(false); navigate(callPath()); });
 }
 
 function renderHead() {
   const h = $('.main-head'); if (!h) return;
   const c = chan();
   h.innerHTML = `<button class="icon-btn menu-toggle" id="menu-toggle">${icon('menu')}</button>
-    ${!S.serverId && S.dmId ? (() => { const d = S.dms.find((x) => x.id === S.dmId); return d ? `${avatarHtml(d.user, 'sm')}<span>${esc(d.user.display_name)}</span><span class="topic">@${esc(d.user.username || '')} · ${d.user.online ? 'Online' : 'Offline'}</span>${!S.friends.friends.some((f) => f.user.id === d.user.id) && d.user.username ? `<button class="btn ghost sm-btn" id="dm-add-friend" style="margin-left:auto">${icon('userPlus')}Adicionar amigo</button>` : ''}` : ''; })() : c ? `${icon(c.kind === 'voice' ? 'volume' : c.read_only ? 'megaphone' : 'hash', 'muted')}<span>${esc(c.name)}</span>${c.topic ? `<span class="topic">${esc(c.topic)}</span>` : ''}` : `<span>${esc(current()?.name || 'Conversas')}</span>`}
+    ${!S.serverId && S.dmId ? (() => { const d = S.dms.find((x) => x.id === S.dmId); return d ? `<span class="clickable head-user" data-profile="${d.user.id}">${avatarHtml(d.user, 'sm')}<span>${esc(d.user.display_name)}</span></span><span class="topic">@${esc(d.user.username || '')} · ${d.user.online ? 'Online' : 'Offline'}</span><span style="margin-left:auto;display:flex;gap:4px;align-items:center">${!S.friends.friends.some((f) => f.user.id === d.user.id) && d.user.username ? `<button class="btn ghost sm-btn" id="dm-add-friend">${icon('userPlus')}Adicionar amigo</button>` : ''}
+      <button class="icon-btn" id="dm-voice" title="Iniciar chamada de voz">${icon('phone')}</button><button class="icon-btn" id="dm-video" title="Iniciar chamada de vídeo">${icon('video')}</button></span>` : ''; })() : c ? `${icon(c.kind === 'voice' ? 'volume' : c.read_only ? 'megaphone' : 'hash', 'muted')}<span>${esc(c.name)}</span>${c.topic ? `<span class="topic">${esc(c.topic)}</span>` : ''}` : `<span>${esc(current()?.name || 'Conversas')}</span>`}
     <span class="spacer"></span>
     ${current() ? `<button class="icon-btn" id="head-invite" title="Convidar pessoas">${icon('userPlus')}</button>
     <button class="icon-btn" id="head-members" title="Membros">${icon('users')}</button>` : ''}`;
   $('#menu-toggle').onclick = () => setNav(true);
   $('#head-invite')?.addEventListener('click', () => inviteDialog());
+  $('#dm-voice')?.addEventListener('click', () => startDmCall(false));
+  $('#dm-video')?.addEventListener('click', () => startDmCall(true));
   $('#dm-add-friend')?.addEventListener('click', () => { const d = S.dms.find((x) => x.id === S.dmId); if (d) addFriendByUsername(d.user.username); });
   $('#head-members')?.addEventListener('click', () => serverSettings('members'));
 }
@@ -583,6 +634,7 @@ function renderThread(el) {
   const canFiles = t.attach.images || t.attach.files || t.attach.audio;
   const canVoice = t.attach.audio && !!window.MediaRecorder && !!navigator.mediaDevices?.getUserMedia;
   el.innerHTML = `<div class="main-head"></div>
+    ${t.dm ? '<div id="dm-call-slot"></div>' : ''}
     <div class="messages" id="messages"></div>
     ${t.canPost ? `<form class="composer" id="composer" data-attach="${esc(JSON.stringify(t.chan?.can_attach || {}))}">
       <div class="pending hidden" id="pending"></div>
@@ -598,6 +650,7 @@ function renderThread(el) {
     </form>`
     : `<div class="composer"><div class="composer-box readonly">${icon('lock')}Você não tem permissão para enviar mensagens neste canal.</div></div>`}`;
   renderHead();
+  if (t.dm) fillDmCallSlot();
   if (t.dm?.request) {
     $('#composer')?.insertAdjacentHTML('beforebegin', `<div class="req-banner">${avatarHtml(t.dm.user, 'sm')}<span><b>${esc(t.dm.user.display_name)}</b> ainda não é seu amigo e quer conversar com você.</span>
       <button class="btn ghost" id="req-no">Recusar</button><button class="btn primary" id="req-yes">Aceitar</button></div>`);
@@ -778,11 +831,14 @@ function messageHtml(m, prev, t) {
   const day = !prev || fmtDay(prev.created_at) !== fmtDay(m.created_at) ? `<div class="day-sep">${fmtDay(m.created_at)}</div>` : '';
   const canDel = t?.canDel(m);
   const user = { display_name: m.author_name, avatar_url: m.author_avatar };
+  if (S.blockedIds?.has(m.author_id) && !S.shownBlocked?.has(m.id)) {
+    return `${day}<div class="msg head blocked-msg" data-mid="${m.id}"><div class="gutter"></div><div class="body"><span class="hint">${icon('block')} Mensagem de alguém que você bloqueou — <button class="link-btn" data-showblocked="${m.id}">mostrar</button></span></div></div>`;
+  }
   return `${day}<div class="msg ${head ? 'head' : ''}" data-mid="${m.id}">
-    <div class="gutter">${head ? avatarHtml(user) : `<time>${fmtTime(m.created_at)}</time>`}</div>
-    <div class="body">${head ? `<div class="meta"><b style="color:${safeColor(m.author_color) || 'inherit'}">${esc(m.author_name)}</b><time>${fmtDay(m.created_at)} às ${fmtTime(m.created_at)}</time></div>` : ''}
+    <div class="gutter">${head ? `<span class="clickable" data-profile="${m.author_id}">${avatarHtml(user)}</span>` : `<time>${fmtTime(m.created_at)}</time>`}</div>
+    <div class="body">${head ? `<div class="meta"><b class="clickable" data-profile="${m.author_id}" style="color:${safeColor(m.author_color) || 'inherit'}">${esc(m.author_name)}</b>${badgesHtml(m.author_badges)}<time>${fmtDay(m.created_at)} às ${fmtTime(m.created_at)}</time></div>` : ''}
       ${m.content ? `<div class="text">${linkify(m.content)}</div>` : ''}${attachmentsHtml(m.attachments)}</div>
-    ${canDel ? `<div class="actions"><button class="icon-btn" data-del="${m.id}" title="Excluir mensagem">${icon('trash')}</button></div>` : ''}
+    <div class="actions">${m.author_id !== S.me.id ? `<button class="icon-btn" data-report="${m.id}" title="Denunciar mensagem">${icon('flag')}</button>` : ''}${canDel ? `<button class="icon-btn" data-del="${m.id}" title="Excluir mensagem">${icon('trash')}</button>` : ''}</div>
   </div>`;
 }
 function renderMessages(toBottom) {
@@ -808,6 +864,8 @@ function appendMessage(m) {
   if (nearBottom) box.scrollTop = box.scrollHeight;
 }
 function bindMessageActions(box) {
+  $$('[data-report]', box).forEach((b) => { b.onclick = () => reportDialog({ type: 'message', target: b.dataset.report }); });
+  $$('[data-showblocked]', box).forEach((b) => { b.onclick = () => { (S.shownBlocked ||= new Set()).add(b.dataset.showblocked); renderMessages(false); }; });
   $$('[data-lightbox]', box).forEach((b) => {
     b.onclick = () => {
       const m = openModal(`<img class="lightbox" src="${esc(b.dataset.lightbox)}" alt=""><div class="foot"><a class="btn" href="${esc(b.dataset.lightbox)}" target="_blank" rel="noopener">${icon('download')}Abrir original</a><button class="btn primary" id="lb-close">Fechar</button></div>`);
@@ -893,7 +951,7 @@ function renderFriendsPage(el) {
   const body = $('#friends-body');
   const row = (u, actions, sub) => `
     <div class="friend-row">
-      <span style="position:relative">${avatarHtml(u)}<span class="dot ${u.online ? 'on' : ''}"></span></span>
+      <span style="position:relative" class="clickable" data-profile="${u.id}">${avatarHtml(u)}<span class="dot ${u.online ? 'on' : ''}"></span></span>
       <div class="nm"><b>${esc(u.display_name)}</b> <span class="uname">@${esc(u.username)}</span><small>${sub}</small></div>
       <div class="friend-actions">${actions}</div>
     </div>`;
@@ -1016,6 +1074,9 @@ async function newDmDialog() {
 
 // =============================================================== chamadas (WebRTC)
 let call = null;
+// a chamada atual está na tela? (canal de voz aberto ou a conversa privada da chamada)
+const callPath = (c = call) => (c?.dm ? `/dm/${c.dm}` : `/s/${c.serverId}/${c.channelId}`);
+const callVisible = (c = call) => !!c && (c.dm ? (!S.serverId && S.dmId === c.dm) : S.channelId === c.channelId);
 let audioCtx = null;
 
 function renderVoiceChannel(el, c) {
@@ -1065,10 +1126,11 @@ function audioConstraints() {
   return { deviceId: cs.micId ? { ideal: cs.micId } : undefined, echoCancellation: cs.echoCancellation, noiseSuppression: cs.noiseSuppression, autoGainControl: cs.autoGainControl };
 }
 
-async function joinCall(cid) {
+async function joinCall(cid, opts = {}) {
   if (call) leaveCall(true);
-  if (!S.iceServers) {
-    try { S.iceServers = (await api('/api/config')).iceServers; } catch { S.iceServers = [{ urls: 'stun:stun.l.google.com:19302' }]; }
+  // pega servidores de conexão novos a cada chamada (as credenciais do TURN vencem)
+  if (!S.iceAt || Date.now() - S.iceAt > 3600e3) {
+    try { S.iceServers = (await api('/api/config')).iceServers; S.iceAt = Date.now(); } catch { S.iceServers = S.iceServers || [{ urls: 'stun:stun.l.google.com:19302' }]; }
   }
   let audioTrack = null;
   try {
@@ -1077,17 +1139,26 @@ async function joinCall(cid) {
   } catch (e) {
     toast('Não consegui acessar o microfone — você entrou sem áudio. Verifique a permissão do navegador.', true);
   }
+  const dm = cid.startsWith('dm:') ? cid.slice(3) : null;
   call = {
-    channelId: cid, serverId: S.serverId, audioTrack, camTrack: null, screenTrack: null,
-    muted: !audioTrack, deafened: false, peers: new Map(), gridKey: null,
+    channelId: cid, serverId: dm ? null : S.serverId, dm, audioTrack, camTrack: null, screenTrack: null,
+    muted: !audioTrack, deafened: false, peers: new Map(), gridKey: null, startedAt: Date.now(),
   };
+  stopRing(dm);
   if (!audioCtx) { try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch { /* sem análise de fala */ } }
   audioCtx?.resume?.();
   if (audioTrack) watchSpeaking('local', new MediaStream([audioTrack]));
   applyMic();
   if (KEYS.ptt.on) toast(`Apertar para falar ligado: segure ${codeLabel(KEYS.ptt.code)} para falar.`);
-  socket.emit('voice:join', cid, (res) => {
+  socket.emit('voice:join', cid, { video: !!opts.video }, (res) => {
     if (!res || res.error) { toast(res?.error || 'Não foi possível entrar.', true); return leaveCall(true); }
+    if (opts.video && !call.camTrack) toggleCamera();
+    if (dm && !res.peers.length) {
+      // ninguém atendeu em 45 segundos: desliga sozinho
+      call.ringTimer = setTimeout(() => {
+        if (call?.dm === dm && (S.voice[cid] || []).length <= 1) { leaveCall(); toast('Ninguém atendeu.'); }
+      }, 45000);
+    }
     if (res.listen_only) {
       call.listenOnly = true; call.muted = true;
       applyMic();
@@ -1099,7 +1170,8 @@ async function joinCall(cid) {
     res.peers.forEach((p) => createPeer(p.socket_id, true));
   });
   call.speakTimer = setInterval(checkSpeaking, 150);
-  renderSidebar(); renderMain();
+  renderSidebar();
+  if (dm) fillDmCallSlot(); else renderMain();
 }
 
 function leaveCall(silent) {
@@ -1111,12 +1183,25 @@ function leaveCall(silent) {
   [c.audioTrack, c.camTrack, c.screenTrack, c.screenAudioTrack].forEach((t) => t?.stop());
   c.focusKey = null;
   clearInterval(c.speakTimer);
+  clearTimeout(c.ringTimer);
   speakers.clear();
   if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
   renderSidebar();
-  if (S.channelId === c.channelId) renderMain();
+  if (callVisible(c)) { if (c.dm) fillDmCallSlot(); else renderMain(); }
 }
 
+// o navegador pode bloquear som automático: mostra um botão para liberar
+function playAudio(el) {
+  if (!el) return;
+  el.play().catch((err) => {
+    if (err?.name !== 'NotAllowedError' || $('#audio-unlock')) return;
+    const b = document.createElement('button');
+    b.id = 'audio-unlock'; b.className = 'audio-unlock';
+    b.innerHTML = `${icon('volume')} Clique aqui para ouvir a chamada`;
+    b.onclick = () => { call?.peers.forEach((p) => { p.audioEl?.play().catch(() => {}); p.screenAudioEl?.play().catch(() => {}); }); b.remove(); };
+    document.body.appendChild(b);
+  });
+}
 function createPeer(peerId, initiator) {
   const pc = new RTCPeerConnection({ iceServers: S.iceServers });
   const peer = { pc, pending: [], audio: new MediaStream(), cam: new MediaStream(), screen: new MediaStream(), screenAudio: new MediaStream(), audioEl: null, screenAudioEl: null };
@@ -1140,12 +1225,22 @@ function createPeer(peerId, initiator) {
     const target = [peer.audio, peer.cam, peer.screen, peer.screenAudio][idx] || peer.screen;
     target.getTracks().forEach((t) => target.removeTrack(t));
     target.addTrack(e.track);
-    if (idx === 0) { el.play().catch(() => {}); watchSpeaking(peerId, peer.audio); }
-    if (idx === 3) peer.screenAudioEl.play().catch(() => {});
-    call && (call.gridKey = null, updateCallGrid());
+    // só mostra o vídeo quando a imagem realmente começa a chegar (evita tela preta)
+    const redraw = () => { if (call) { call.gridKey = null; updateCallGrid(); } };
+    e.track.onunmute = redraw; e.track.onmute = redraw;
+    if (idx === 0) { playAudio(el); watchSpeaking(peerId, peer.audio); }
+    if (idx === 3) playAudio(peer.screenAudioEl);
+    redraw();
   };
-  pc.onconnectionstatechange = () => {
-    if (pc.connectionState === 'failed' && initiator) makeOffer(peerId, true);
+  pc.oniceconnectionstatechange = () => {
+    peer.state = pc.iceConnectionState;
+    if (call) { call.gridKey = null; updateCallGrid(); }
+    if (pc.iceConnectionState === 'failed') {
+      peer.fails = (peer.fails || 0) + 1;
+      if (initiator && peer.fails <= 2) makeOffer(peerId, true);
+      if (peer.fails === 2 || (!initiator && peer.fails === 1)) toast('Não consegui conectar a chamada com essa pessoa. A rede de um de vocês pode estar bloqueando — tente outra rede (Wi-Fi ↔ 4G).', true);
+    }
+    if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') { playAudio(el); playAudio(peer.screenAudioEl); }
   };
   if (initiator) {
     pc.addTransceiver('audio', { direction: 'sendrecv' });
@@ -1302,14 +1397,19 @@ async function toggleScreen() {
 // monta a grade de vídeos
 function updateCallGrid() {
   const grid = $('#call-grid');
-  if (!grid || !call || S.channelId !== call.channelId) return;
+  if (!grid || !call || !callVisible()) return;
   const parts = S.voice[call.channelId] || [];
   const tiles = [];
   parts.forEach((p) => {
     const mine = p.socket_id === socket.id;
     const peer = call.peers.get(p.socket_id);
-    const camOn = mine ? !!call.camTrack : p.camera && peer?.cam.getVideoTracks().length;
-    const scrOn = mine ? !!call.screenTrack : p.screen && peer?.screen.getVideoTracks().length;
+    const live = (st) => { const tr = st?.getVideoTracks()[0]; return !!tr && !tr.muted && tr.readyState === 'live'; };
+    const camOn = mine ? !!call.camTrack : p.camera && live(peer?.cam);
+    const scrWait = !mine && p.screen && !live(peer?.screen);
+    const scrOn = mine ? !!call.screenTrack : p.screen && live(peer?.screen);
+    p.connecting = !mine && peer && !['connected', 'completed'].includes(peer.pc.iceConnectionState);
+    p.failed = !mine && peer?.pc.iceConnectionState === 'failed';
+    if (scrWait) tiles.push({ key: p.socket_id + ':sw', p, kind: 'wait', mine });
     if (scrOn) tiles.push({ key: p.socket_id + ':s', p, kind: 'screen', mine });
     tiles.push({ key: p.socket_id + ':c', p, kind: camOn ? 'cam' : 'avatar', mine });
   });
@@ -1317,8 +1417,9 @@ function updateCallGrid() {
   if (call.focusKey && !tiles.some((t) => t.key === call.focusKey)) exitFocus(true);
   const shown = call.focusKey ? tiles.filter((t) => t.key === call.focusKey) : tiles.slice();
   grid.classList.toggle('focus', !!call.focusKey);
-  const key = (call.focusKey || '') + shown.map((t) => t.key + t.kind + t.p.muted + t.p.display_name + t.p.avatar_url).join('|');
-  $('#call-alone').textContent = parts.length <= 1 ? 'Você está sozinho aqui. Chame seus amigos para este canal.' : '';
+  const key = (call.focusKey || '') + shown.map((t) => t.key + t.kind + t.p.muted + t.p.display_name + t.p.avatar_url + t.p.connecting + t.p.failed).join('|');
+  const dmUser = call.dm ? S.dms.find((d) => d.id === call.dm)?.user : null;
+  $('#call-alone').textContent = parts.length <= 1 ? (dmUser ? `Esperando ${dmUser.display_name} entrar…` : 'Você está sozinho aqui. Chame seus amigos para este canal.') : '';
   if (key === call.gridKey) return;
   call.gridKey = key;
   tiles.length = 0; tiles.push(...shown);
@@ -1329,8 +1430,9 @@ function updateCallGrid() {
   grid.style.margin = '0 auto'; grid.style.width = '100%';
   grid.innerHTML = tiles.map((t) => `
     <div class="tile ${t.kind === 'screen' ? 'screen' : ''} ${t.mine && t.kind === 'cam' ? 'mirror' : ''}" data-sock="${t.kind === 'screen' ? '' : (t.mine ? 'local' : t.p.socket_id)}" data-key="${t.key}">
-      ${t.kind === 'avatar' ? avatarHtml(t.p) : '<video autoplay playsinline muted></video>'}
-      <div class="label">${t.p.muted ? `<span class="red">${icon('micOff')}</span>` : icon('mic')}${esc(t.p.display_name)}${t.mine ? ' (você)' : ''}${t.kind === 'screen' ? ' — tela' : ''}</div>
+      ${t.kind === 'avatar' ? avatarHtml(t.p) : t.kind === 'wait' ? `<div class="tile-wait"><div class="spinner"></div><span>${t.p.failed ? 'Não conectou 😕' : 'Carregando a transmissão…'}</span></div>` : '<video autoplay playsinline muted></video>'}
+      ${t.p.failed ? '<div class="tile-status bad">Sem conexão</div>' : t.p.connecting ? '<div class="tile-status">Conectando…</div>' : ''}
+      <div class="label">${t.p.muted ? `<span class="red">${icon('micOff')}</span>` : icon('mic')}${esc(t.p.display_name)}${t.mine ? ' (você)' : ''}${t.kind === 'screen' || t.kind === 'wait' ? ' — tela' : ''}</div>
       <button class="icon-btn fs" title="${call.focusKey ? 'Sair da tela cheia' : 'Tela cheia'}">${icon(call.focusKey ? 'shrink' : 'expand')}</button>
     </div>`).join('');
   tiles.forEach((t) => {
@@ -1408,6 +1510,10 @@ function closeModal() {
   if (root._onClose) { const f = root._onClose; root._onClose = null; f(); }
   root.innerHTML = '';
 }
+document.addEventListener('click', (e) => {
+  const p = e.target.closest('[data-profile]');
+  if (p && !e.target.closest('button:not([data-profile])')) { e.preventDefault(); openProfile(p.dataset.profile); }
+});
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') { if ($('.menu')) $('.menu').remove(); else if ($('#modal-root').innerHTML) closeModal(); }
 });
@@ -1829,8 +1935,8 @@ async function ssMembers(el) {
     const rank = (u) => { const i = rl.findIndex((r) => u.role_ids.includes(r.id) && r.hoist); return i < 0 ? 999 : i; };
     list.sort((a, b) => (b.is_owner - a.is_owner) || (rank(a) - rank(b)) || (b.online - a.online) || a.display_name.localeCompare(b.display_name));
     el.innerHTML = `<h3>Membros — ${list.length}</h3>${list.map((u) => `
-      <div class="member-row"><span style="position:relative">${avatarHtml(u)}<span class="dot ${u.online ? 'on' : ''}"></span></span>
-        <div class="nm"><b style="color:${safeColor(u.color) || 'inherit'}">${esc(u.display_name)}</b> ${u.is_owner ? '<span class="badge">DONO</span>' : ''}
+      <div class="member-row"><span style="position:relative" class="clickable" data-profile="${u.id}">${avatarHtml(u)}<span class="dot ${u.online ? 'on' : ''}"></span></span>
+        <div class="nm"><b class="clickable" data-profile="${u.id}" style="color:${safeColor(u.color) || 'inherit'}">${esc(u.display_name)}</b> ${u.is_owner ? '<span class="badge">DONO</span>' : ''}
           <div class="chips">${rl.filter((r) => u.role_ids.includes(r.id)).map((r) => `<span class="chip"><span class="role-dot" style="background:${safeColor(r.color) || '#99aab5'}"></span>${esc(r.name)}</span>`).join('')}</div>
           <small>@${esc(u.username || '')} · ${u.online ? 'Online' : 'Offline'} · entrou em ${new Date(u.joined_at).toLocaleDateString('pt-BR')}</small></div>
         ${u.id !== S.me.id ? `<button class="icon-btn" data-msg="${u.id}" title="Mandar mensagem">${icon('chat')}</button>` : ''}
@@ -1911,7 +2017,9 @@ function userSettings(tab = 'profile') {
   const cleanup = [];
   const m = openModal(`
     <nav class="settings-nav"><h4>Configurações</h4>
-      <button data-tab="profile">Perfil</button><button data-tab="call">Voz e vídeo</button><button data-tab="keys">Atalhos</button><button data-tab="account">Conta</button>
+      <button data-tab="profile">Perfil</button><button data-tab="privacy">Privacidade</button><button data-tab="security">Segurança</button>
+      <button data-tab="devices">Dispositivos</button><button data-tab="call">Voz e vídeo</button><button data-tab="keys">Atalhos</button>
+      <button data-tab="report">Relatar problema</button>${S.me.is_admin ? '<button data-tab="admin">Denúncias (equipe)</button>' : ''}
       <button class="red" data-tab="logout">Sair</button></nav>
     <section class="settings-body"><button class="icon-btn close" id="us-close">${icon('x')}</button><div id="us-body"></div></section>`,
   { wide: true, onClose: () => { capturing = null; cleanup.splice(0).forEach((f) => f()); } });
@@ -1921,26 +2029,50 @@ function userSettings(tab = 'profile') {
     cleanup.splice(0).forEach((f) => f());
     $$('[data-tab]', m).forEach((b) => b.classList.toggle('active', b.dataset.tab === t));
     capturing = null;
-    ({ profile: usProfile, call: usCall, keys: usKeys, account: usAccount })[t]($('#us-body', m), cleanup);
+    ({ profile: usProfile, privacy: usPrivacy, security: usSecurity, devices: usDevices, call: usCall, keys: usKeys, report: usReport, admin: usAdmin, account: usSecurity })[t]($('#us-body', m), cleanup);
   };
   $$('[data-tab]', m).forEach((b) => { b.onclick = () => show(b.dataset.tab); });
   show(tab);
 }
+
+const BADGES = { fundador: ['🏅', 'Membro fundador'], equipe: ['🛡️', 'Equipe Lumix'] };
+const badgesHtml = (list = []) => list.map((b) => BADGES[b] ? `<span class="ubadge" title="${BADGES[b][1]}">${BADGES[b][0]}</span>` : '').join('');
+
 function usProfile(el) {
-  const st = { display_name: S.me.display_name, avatar_url: S.me.avatar_url, username: S.me.username };
+  const st = { display_name: S.me.display_name, avatar_url: S.me.avatar_url, username: S.me.username, bio: S.me.bio || '', status_text: S.me.status_text || '', banner_url: S.me.banner_url || '', accent: S.me.accent || '#1f6bff' };
   el.innerHTML = `<h3>Perfil</h3>
-    <div class="upload-row"><div id="up-prev"></div><div style="display:flex;gap:8px;flex-wrap:wrap"><button class="btn" id="up-up">Alterar foto</button><button class="btn ghost" id="up-rm">Remover</button></div></div>
-    <div class="field"><label>Nome de exibição</label><input class="input" id="up-name" maxlength="32" value="${esc(st.display_name)}"></div>
-    <div class="field"><label>Nome de usuário</label><div class="at-input"><span>@</span><input class="input" id="up-user" maxlength="20" value="${esc(S.me.username || '')}" spellcheck="false"></div><span class="hint">Seus amigos usam esse nome para te adicionar.</span></div>
-    <div class="field"><label>E-mail</label><input class="input" value="${esc(S.me.email)}" disabled></div>
-    <div class="error-text" id="up-err"></div>
-    <button class="btn primary" id="up-save">Salvar alterações</button>`;
-  const prev = () => { $('#up-prev', el).innerHTML = avatarHtml({ ...st, display_name: st.display_name || '?' }, 'lg'); };
+    <div class="profile-edit">
+      <div class="pe-form">
+        <div class="field"><label>Nome de exibição</label><input class="input" id="up-name" maxlength="32" value="${esc(st.display_name)}"></div>
+        <div class="field"><label>Nome de usuário</label><div class="at-input"><span>@</span><input class="input" id="up-user" maxlength="20" value="${esc(st.username || '')}" spellcheck="false"></div></div>
+        <div class="field"><label>Status</label><input class="input" id="up-status" maxlength="60" value="${esc(st.status_text)}" placeholder="Ex.: 🎮 jogando GTA RP"></div>
+        <div class="field"><label>Sobre mim</label><textarea class="input" id="up-bio" maxlength="190" rows="3" style="height:auto;padding:10px 12px;resize:vertical" placeholder="Conte um pouco sobre você">${esc(st.bio)}</textarea><span class="hint" id="bio-count"></span></div>
+        <div class="field"><label>Foto e capa</label><div style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn" id="up-up">Alterar foto</button><button class="btn ghost" id="up-rm">Tirar foto</button>
+          <button class="btn" id="up-cover">Alterar capa</button><button class="btn ghost" id="up-cover-rm">Tirar capa</button></div></div>
+        <div class="field"><label>Cor do perfil</label><div style="display:flex;gap:10px;align-items:center"><input type="color" id="up-accent" class="color-pick" value="${esc(st.accent)}">
+          ${['#1f6bff', '#ff2a2e', '#a855f7', '#22c55e', '#eab308', '#ec4899', '#06b6d4', '#64748b'].map((c) => `<button type="button" class="swatch" data-sw="${c}" style="background:${c}"></button>`).join('')}</div></div>
+        <div class="field"><label>E-mail</label><input class="input" value="${esc(S.me.email)}" disabled></div>
+        <div class="error-text" id="up-err"></div>
+        <button class="btn primary" id="up-save">Salvar alterações</button>
+      </div>
+      <div class="pe-preview"><label class="hint">Prévia</label><div id="up-prev"></div></div>
+    </div>`;
+  const prev = () => {
+    $('#up-prev', el).innerHTML = profileCardHtml({ ...S.me, ...st, display_name: st.display_name || '?', badges: S.me.badges, created_at: S.me.created_at, online: true });
+    $('#bio-count', el).textContent = `${190 - st.bio.length} caracteres restantes`;
+  };
   prev();
   $('#up-name', el).oninput = (e) => { st.display_name = e.target.value; prev(); };
-  $('#up-user', el).oninput = (e) => { e.target.value = e.target.value.toLowerCase().replace(/[^a-z0-9_.]/g, ''); st.username = e.target.value; };
+  $('#up-user', el).oninput = (e) => { e.target.value = e.target.value.toLowerCase().replace(/[^a-z0-9_.]/g, ''); st.username = e.target.value; prev(); };
+  $('#up-status', el).oninput = (e) => { st.status_text = e.target.value; prev(); };
+  $('#up-bio', el).oninput = (e) => { st.bio = e.target.value; prev(); };
+  $('#up-accent', el).oninput = (e) => { st.accent = e.target.value; prev(); };
+  $$('[data-sw]', el).forEach((b) => { b.onclick = () => { st.accent = b.dataset.sw; $('#up-accent', el).value = b.dataset.sw; prev(); }; });
   $('#up-up', el).onclick = async () => { const u = await pickImage(); if (u) { st.avatar_url = u; prev(); } };
   $('#up-rm', el).onclick = () => { st.avatar_url = ''; prev(); };
+  $('#up-cover', el).onclick = async () => { const u = await pickImage(900); if (u) { st.banner_url = u; prev(); } };
+  $('#up-cover-rm', el).onclick = () => { st.banner_url = ''; prev(); };
   $('#up-save', el).onclick = async (e) => {
     e.target.disabled = true; $('#up-err', el).textContent = '';
     try { S.me = await api('/api/me', { method: 'PATCH', body: st }); renderSidebar(); toast('Perfil atualizado.'); }
@@ -1948,6 +2080,242 @@ function usProfile(el) {
     e.target.disabled = false;
   };
 }
+
+function profileCardHtml(u, extra = '') {
+  const accent = safeColor(u.accent) || '#1f6bff';
+  return `<div class="pcard" style="--pc:${accent}">
+    <div class="pcard-cover" style="${u.banner_url ? `background-image:url('${esc(u.banner_url)}')` : ''}"></div>
+    <div class="pcard-top">${avatarHtml(u, 'xl')}<span class="dot ${u.online ? 'on' : ''}"></span></div>
+    <div class="pcard-body">
+      <div class="pcard-name">${esc(u.display_name)} ${badgesHtml(u.badges)}</div>
+      <div class="pcard-user">@${esc(u.username || '')}</div>
+      ${u.status_text ? `<div class="pcard-status">${esc(u.status_text)}</div>` : ''}
+      ${u.bio ? `<div class="pcard-sec"><h5>Sobre mim</h5><p>${linkify(u.bio)}</p></div>` : ''}
+      ${u.created_at ? `<div class="pcard-sec"><h5>Membro desde</h5><p>${new Date(u.created_at).toLocaleDateString('pt-BR', { day: '2-digit', month: 'long', year: 'numeric' })}</p></div>` : ''}
+      ${extra}
+    </div></div>`;
+}
+
+async function openProfile(uid) {
+  if (!uid) return;
+  let u;
+  try { u = await api(`/api/users/${uid}`); } catch (e) { return toast(e.message, true); }
+  const mutual = u.mutual_servers.length ? `<div class="pcard-sec"><h5>Servidores em comum — ${u.mutual_servers.length}</h5><div class="mutuals">${u.mutual_servers.map((s) => `<button class="mutual" data-go="/s/${s.id}">${serverIconHtml(s, 'mini-icon')}<span>${esc(s.name)}</span></button>`).join('')}</div></div>` : '';
+  const actions = u.me ? `<button class="btn" id="pf-edit">${icon('edit')}Editar perfil</button>` : `
+    <button class="btn primary" id="pf-msg" ${u.blocked ? 'disabled' : ''}>${icon('chat')}Mensagem</button>
+    ${u.friendship === 'friends' ? `<button class="btn" id="pf-unfriend">${icon('userMinus')}Desfazer amizade</button>`
+      : u.friendship === 'incoming' ? `<button class="btn" id="pf-accept">${icon('check')}Aceitar pedido</button>`
+      : u.friendship === 'outgoing' ? '<button class="btn" disabled>Pedido enviado</button>'
+      : `<button class="btn" id="pf-add" ${u.blocked ? 'disabled' : ''}>${icon('userPlus')}Adicionar amigo</button>`}
+    <button class="icon-btn" id="pf-more" title="Mais opções">${icon('more')}</button>`;
+  const m = openModal(profileCardHtml(u, mutual + (u.mutual_friends ? `<p class="hint">${u.mutual_friends} ${u.mutual_friends === 1 ? 'amigo' : 'amigos'} em comum</p>` : '')) + `<div class="pcard-actions">${actions}</div>`);
+  m.classList.add('profile-modal');
+  $$('[data-go]', m).forEach((b) => { b.onclick = () => { closeModal(); navigate(b.dataset.go); }; });
+  $('#pf-edit', m)?.addEventListener('click', () => userSettings('profile'));
+  $('#pf-msg', m)?.addEventListener('click', () => openDm(u.id));
+  $('#pf-add', m)?.addEventListener('click', async () => { await addFriendByUsername(u.username); closeModal(); });
+  $('#pf-accept', m)?.addEventListener('click', async () => { await api(`/api/friends/${u.friendship_id}/accept`, { method: 'POST' }).catch((e) => toast(e.message, true)); closeModal(); toast('Pedido aceito!'); });
+  $('#pf-unfriend', m)?.addEventListener('click', async () => { if (!confirm(`Desfazer amizade com ${u.display_name}?`)) return; await api(`/api/friends/${u.friendship_id}`, { method: 'DELETE' }).catch((e) => toast(e.message, true)); closeModal(); });
+  $('#pf-more', m)?.addEventListener('click', (e) => {
+    popMenu(e.currentTarget, [
+      [u.blocked ? 'Desbloquear' : 'Bloquear', u.blocked ? 'check' : 'block', () => toggleBlock(u), !u.blocked],
+      ['Denunciar perfil', 'flag', () => reportDialog({ type: 'user', target: u.id, name: u.display_name }), true],
+      ['Copiar nome de usuário', 'copy', () => navigator.clipboard?.writeText('@' + u.username).then(() => toast('Copiado!'))],
+    ]);
+  });
+}
+function popMenu(anchor, items) {
+  $('.menu')?.remove();
+  const r = anchor.getBoundingClientRect();
+  const menu = document.createElement('div');
+  menu.className = 'menu';
+  menu.innerHTML = items.map(([label, ic, , red], i) => `<button data-i="${i}" class="${red ? 'red' : ''}">${label} ${icon(ic)}</button>`).join('');
+  document.body.appendChild(menu);
+  menu.style.left = Math.max(8, Math.min(r.left, innerWidth - 240)) + 'px';
+  menu.style.top = Math.min(r.bottom + 6, innerHeight - menu.offsetHeight - 8) + 'px';
+  const off = (e) => { if (!menu.contains(e.target)) { menu.remove(); document.removeEventListener('mousedown', off); } };
+  setTimeout(() => document.addEventListener('mousedown', off));
+  menu.onclick = (e) => { const b = e.target.closest('[data-i]'); if (!b) return; menu.remove(); items[+b.dataset.i][2](); };
+}
+async function toggleBlock(u) {
+  if (!u.blocked && !confirm(`Bloquear ${u.display_name}? Vocês deixam de ser amigos, ${u.display_name} não consegue te mandar mensagem nem ligar, e as mensagens dessa pessoa ficam escondidas para você.`)) return;
+  try {
+    if (u.blocked) await api(`/api/blocks/${u.id}`, { method: 'DELETE' });
+    else await api('/api/blocks', { method: 'POST', body: { user_id: u.id } });
+    await loadBlocks();
+    closeModal(); toast(u.blocked ? `${u.display_name} foi desbloqueado.` : `${u.display_name} foi bloqueado.`);
+    if (threadFor()) renderMessages(true);
+  } catch (e) { toast(e.message, true); }
+}
+async function loadBlocks() {
+  try { S.blocks = await api('/api/blocks'); } catch { S.blocks = []; }
+  S.blockedIds = new Set(S.blocks.map((b) => b.id));
+}
+
+const REPORT_REASONS = {
+  message: ['Spam ou golpe', 'Ofensa ou assédio', 'Conteúdo +18 ou violento', 'Dados pessoais expostos', 'Outro motivo'],
+  user: ['Spam ou golpe', 'Ofensa ou assédio', 'Se passando por outra pessoa', 'Conta de menor com conteúdo impróprio', 'Outro motivo'],
+};
+function reportDialog({ type, target, name }) {
+  const reasons = REPORT_REASONS[type];
+  const m = openModal(`<h2>${type === 'message' ? 'Denunciar mensagem' : `Denunciar ${esc(name || 'perfil')}`}</h2>
+    <p class="sub">A equipe da Lumix vai analisar. Quem você denunciou não fica sabendo que foi você.</p>
+    <div class="reasons">${reasons.map((r, i) => `<label class="reason"><input type="radio" name="reason" value="${esc(r)}" ${i === 0 ? 'checked' : ''}>${esc(r)}</label>`).join('')}</div>
+    <div class="field" style="margin-top:12px"><label>Detalhes (opcional)</label><textarea class="input" id="rp-details" rows="3" maxlength="1500" style="height:auto;padding:10px 12px"></textarea></div>
+    <div class="error-text" id="rp-err"></div>
+    <div class="foot"><button class="btn ghost" id="rp-cancel">Cancelar</button><button class="btn danger" id="rp-send">Enviar denúncia</button></div>`);
+  $('#rp-cancel', m).onclick = closeModal;
+  $('#rp-send', m).onclick = async (e) => {
+    e.target.disabled = true;
+    try {
+      await api('/api/reports', { method: 'POST', body: { type, target, reason: $('[name=reason]:checked', m).value, details: $('#rp-details', m).value } });
+      closeModal(); toast('Denúncia enviada. Obrigado por ajudar a manter a Lumix segura!');
+    } catch (err) { $('#rp-err', m).textContent = err.message; e.target.disabled = false; }
+  };
+}
+
+function usReport(el) {
+  el.innerHTML = `<h3>Relatar problema</h3>
+    <p class="hint" style="margin:-8px 0 14px">Achou um erro ou algo não funcionou? Conta pra gente. Quanto mais detalhe, mais rápido a gente arruma.</p>
+    <div class="field"><label>O que aconteceu?</label><select class="input" id="bug-kind">
+      <option>Cadastro ou login</option><option>Mensagens</option><option>Chamadas de voz/vídeo</option><option>Perfil ou amigos</option><option>Servidores e canais</option><option>Celular</option><option>Sugestão de melhoria</option><option>Outro</option></select></div>
+    <div class="field"><label>Descreva</label><textarea class="input" id="bug-text" rows="6" maxlength="1500" style="height:auto;padding:10px 12px" placeholder="O que você fez, o que esperava e o que aconteceu"></textarea></div>
+    <div class="error-text" id="bug-err"></div>
+    <button class="btn primary" id="bug-send">Enviar</button>`;
+  $('#bug-send', el).onclick = async (e) => {
+    e.target.disabled = true; $('#bug-err', el).textContent = '';
+    try {
+      await api('/api/reports', { method: 'POST', body: { type: 'bug', reason: $('#bug-kind', el).value, details: $('#bug-text', el).value, page: `${location.pathname} · ${navigator.userAgent.slice(0, 120)}` } });
+      $('#bug-text', el).value = ''; toast('Recebido! Obrigado por ajudar a melhorar a Lumix.');
+    } catch (err) { $('#bug-err', el).textContent = err.message; }
+    e.target.disabled = false;
+  };
+}
+
+function usPrivacy(el) {
+  const pv = { ...S.me.privacy };
+  el.innerHTML = `<h3>Privacidade</h3>
+    <div class="field"><label>Quem pode me mandar mensagem privada</label><select class="input" id="pv-dms">
+      <option value="servers" ${pv.dms === 'servers' ? 'selected' : ''}>Amigos e quem está nos mesmos servidores</option>
+      <option value="friends" ${pv.dms === 'friends' ? 'selected' : ''}>Só amigos</option></select></div>
+    <div class="field"><label>Quem pode me mandar pedido de amizade</label><select class="input" id="pv-fr">
+      <option value="everyone" ${pv.friend_requests === 'everyone' ? 'selected' : ''}>Qualquer pessoa</option>
+      <option value="servers" ${pv.friend_requests === 'servers' ? 'selected' : ''}>Só quem está nos mesmos servidores</option>
+      <option value="nobody" ${pv.friend_requests === 'nobody' ? 'selected' : ''}>Ninguém</option></select></div>
+    <div class="switch"><span>Mostrar meu "Sobre mim" para quem não é amigo</span><input type="checkbox" id="pv-bio" ${pv.show_bio ? 'checked' : ''}></div>
+    <button class="btn primary" id="pv-save" style="margin-top:14px">Salvar</button>
+    <h4 class="perm-title" style="margin-top:26px">Usuários bloqueados</h4>
+    <div id="blocked-list"><div class="spinner"></div></div>`;
+  $('#pv-save', el).onclick = async () => {
+    try { S.me = await api('/api/me', { method: 'PATCH', body: { privacy: { dms: $('#pv-dms', el).value, friend_requests: $('#pv-fr', el).value, show_bio: $('#pv-bio', el).checked } } }); toast('Privacidade salva.'); }
+    catch (e) { toast(e.message, true); }
+  };
+  loadBlocks().then(() => {
+    const box = $('#blocked-list', el); if (!box) return;
+    box.innerHTML = S.blocks.length ? S.blocks.map((u) => `<div class="member-row">${avatarHtml(u)}<div class="nm"><b>${esc(u.display_name)}</b><small>@${esc(u.username)}</small></div><button class="btn" data-unblock="${u.id}">Desbloquear</button></div>`).join('')
+      : '<p class="hint">Você não bloqueou ninguém.</p>';
+    $$('[data-unblock]', box).forEach((b) => { b.onclick = async () => { await api(`/api/blocks/${b.dataset.unblock}`, { method: 'DELETE' }); await loadBlocks(); usPrivacy(el); toast('Desbloqueado.'); }; });
+  });
+}
+
+function usSecurity(el) {
+  el.innerHTML = `<h3>Segurança</h3>
+    <h4 class="perm-title">Verificação em duas etapas</h4>
+    <div id="tfa"></div>
+    <h4 class="perm-title" style="margin-top:26px">Alterar senha</h4>
+    <form id="pw"><div class="field"><label>Senha atual</label><input class="input" type="password" name="current" autocomplete="current-password"></div>
+    <div class="field"><label>Nova senha</label><input class="input" type="password" name="next" autocomplete="new-password" minlength="6"></div>
+    <div class="error-text" id="pw-err"></div><button class="btn primary">Alterar senha</button>
+    <p class="hint" style="margin-top:8px">Trocar a senha desconecta seus outros aparelhos.</p></form>`;
+  $('#pw', el).onsubmit = async (e) => {
+    e.preventDefault(); $('#pw-err', el).textContent = '';
+    try { await api('/api/me/password', { method: 'POST', body: Object.fromEntries(new FormData(e.target)) }); e.target.reset(); toast('Senha alterada.'); }
+    catch (err) { $('#pw-err', el).textContent = err.message; }
+  };
+  const box = $('#tfa', el);
+  const drawOff = () => {
+    box.innerHTML = `<p class="hint" style="margin:0 0 12px">Além da senha, o login pede um código de 6 números do app autenticador do seu celular (Google Authenticator, Microsoft Authenticator, Authy…). Mesmo que alguém descubra sua senha, não entra.</p>
+      <button class="btn primary" id="tfa-start">${icon('shield')}Ligar verificação em duas etapas</button>`;
+    $('#tfa-start', box).onclick = async () => {
+      try {
+        const r = await api('/api/2fa/setup', { method: 'POST' });
+        box.innerHTML = `<ol class="tfa-steps"><li>Instale um app autenticador no celular (ex.: Google Authenticator).</li>
+          <li>No app, toque em <b>+</b> e escaneie o QR code — ou digite a chave.</li>
+          <li>Digite abaixo o código de 6 números que aparece no app.</li></ol>
+          <div class="tfa-qr">${r.qr || ''}</div>
+          <p class="hint">Chave: <code class="tfa-key">${esc(r.secret.replace(/(.{4})/g, '$1 ').trim())}</code> · <a href="${esc(r.uri)}">abrir no app (celular)</a></p>
+          <div class="field" style="max-width:220px"><label>Código</label><input class="input" id="tfa-code" inputmode="numeric" maxlength="6" placeholder="000000" autocomplete="one-time-code"></div>
+          <div class="error-text" id="tfa-err"></div>
+          <button class="btn primary" id="tfa-ok">Confirmar e ligar</button> <button class="btn ghost" id="tfa-cancel">Cancelar</button>`;
+        $('#tfa-cancel', box).onclick = drawOff;
+        $('#tfa-ok', box).onclick = async () => {
+          try {
+            const res = await api('/api/2fa/enable', { method: 'POST', body: { code: $('#tfa-code', box).value } });
+            S.me.two_factor = true;
+            box.innerHTML = `<div class="tfa-done">${icon('check')} Verificação em duas etapas <b>ligada</b>!</div>
+              <p><b>Guarde estes códigos de recuperação</b> num lugar seguro. Cada um funciona uma vez, se você perder o celular:</p>
+              <div class="backup-codes">${res.backup_codes.map((c) => `<code>${c}</code>`).join('')}</div>
+              <button class="btn" id="tfa-copy">${icon('copy')}Copiar códigos</button> <button class="btn primary" id="tfa-fin">Já guardei</button>`;
+            $('#tfa-copy', box).onclick = () => navigator.clipboard?.writeText(res.backup_codes.join('\n')).then(() => toast('Códigos copiados.'));
+            $('#tfa-fin', box).onclick = drawOn;
+          } catch (e) { $('#tfa-err', box).textContent = e.message; }
+        };
+      } catch (e) { toast(e.message, true); }
+    };
+  };
+  const drawOn = () => {
+    box.innerHTML = `<div class="tfa-done">${icon('shield')} Ligada — seu login pede o código do app autenticador.</div>
+      <details class="tfa-off"><summary>Desligar verificação em duas etapas</summary>
+        <div class="field"><label>Senha</label><input class="input" type="password" id="off-pw"></div>
+        <div class="field"><label>Código do app (ou código de recuperação)</label><input class="input" id="off-code"></div>
+        <div class="error-text" id="off-err"></div><button class="btn danger" id="off-go">Desligar</button></details>`;
+    $('#off-go', box).onclick = async () => {
+      try { await api('/api/2fa/disable', { method: 'POST', body: { password: $('#off-pw', box).value, code: $('#off-code', box).value } }); S.me.two_factor = false; drawOff(); toast('Verificação em duas etapas desligada.'); }
+      catch (e) { $('#off-err', box).textContent = e.message; }
+    };
+  };
+  (S.me.two_factor ? drawOn : drawOff)();
+}
+
+async function usDevices(el) {
+  el.innerHTML = `<h3>Dispositivos</h3><p class="hint" style="margin:-8px 0 14px">Aparelhos com sua conta conectada. Se não reconhecer algum, encerre e troque a senha.</p><div class="spinner"></div>`;
+  let list = [];
+  try { list = await api('/api/sessions'); } catch (e) { toast(e.message, true); }
+  const when = (d) => (d ? new Date(d).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }) : '—');
+  el.innerHTML = `<h3>Dispositivos</h3><p class="hint" style="margin:-8px 0 14px">Aparelhos com sua conta conectada. Se não reconhecer algum, encerre e troque a senha.</p>
+    ${list.map((d) => `<div class="member-row"><span class="dev-ico">${icon(/Android|iPhone/.test(d.device) ? 'phone' : 'screen')}</span>
+      <div class="nm"><b>${esc(d.device)}</b> ${d.current ? '<span class="badge soft">ESTE APARELHO</span>' : ''}<small>${d.ip ? `IP ${esc(d.ip)} · ` : ''}último acesso ${when(d.last_seen)} · entrou ${when(d.created_at)}</small></div>
+      ${d.current ? '' : `<button class="btn danger" data-end="${esc(d.sid)}">Encerrar</button>`}</div>`).join('')}
+    ${list.filter((d) => !d.current).length ? '<button class="btn danger" id="end-all" style="margin-top:14px">Encerrar todos os outros</button>' : ''}`;
+  $$('[data-end]', el).forEach((b) => { b.onclick = async () => { await api(`/api/sessions/${b.dataset.end}`, { method: 'DELETE' }).catch((e) => toast(e.message, true)); usDevices(el); }; });
+  $('#end-all', el)?.addEventListener('click', async () => { if (!confirm('Desconectar todos os outros aparelhos?')) return; await api('/api/sessions/logout-others', { method: 'POST' }); toast('Pronto, só este aparelho está conectado.'); usDevices(el); });
+}
+
+async function usAdmin(el) {
+  el.innerHTML = `<h3>Denúncias e relatos</h3><div class="spinner"></div>`;
+  let list = [];
+  try { list = await api('/api/admin/reports'); } catch (e) { el.innerHTML = `<p class="error-text">${esc(e.message)}</p>`; return; }
+  const tag = { message: 'Mensagem', user: 'Perfil', bug: 'Problema', server: 'Servidor' };
+  el.innerHTML = `<h3>Denúncias e relatos — ${list.filter((r) => r.status === 'aberta').length} abertas</h3>
+    ${list.length ? list.map((r) => `<div class="report ${r.status}">
+      <div class="report-top"><span class="badge">${tag[r.type]}</span><b>${esc(r.reason || '')}</b><span class="spacer"></span><small>${new Date(r.created_at).toLocaleString('pt-BR')}</small></div>
+      <p class="hint">Enviado por ${esc(r.reporter_user?.display_name || '?')} (@${esc(r.reporter_user?.username || '')})${r.target_person ? ` · sobre <b>${esc(r.target_person.display_name)}</b> (@${esc(r.target_person.username)})${r.target_person.banned ? ' — SUSPENSO' : ''}` : ''}</p>
+      ${r.snapshot ? `<blockquote>${esc(r.snapshot.content || '')}${r.snapshot.attachments?.length ? ` <i>(+${r.snapshot.attachments.length} anexo)</i>` : ''}</blockquote>` : ''}
+      ${r.details ? `<p>${esc(r.details)}</p>` : ''}${r.page ? `<p class="hint">${esc(r.page)}</p>` : ''}
+      <div class="report-actions">
+        ${r.status !== 'resolvida' ? `<button class="btn" data-st="resolvida" data-id="${r.id}">${icon('check')}Resolvida</button>` : ''}
+        ${r.status !== 'descartada' ? `<button class="btn ghost" data-st="descartada" data-id="${r.id}">Descartar</button>` : ''}
+        ${r.status !== 'aberta' ? `<button class="btn ghost" data-st="aberta" data-id="${r.id}">Reabrir</button>` : ''}
+        ${r.target_person ? `<button class="btn danger" data-ban="${r.target_person.id}" data-banned="${r.target_person.banned ? 1 : 0}">${r.target_person.banned ? 'Tirar suspensão' : 'Suspender conta'}</button>` : ''}
+      </div></div>`).join('') : '<p class="hint">Nenhuma denúncia ainda.</p>'}`;
+  $$('[data-st]', el).forEach((b) => { b.onclick = async () => { await api(`/api/admin/reports/${b.dataset.id}`, { method: 'PATCH', body: { status: b.dataset.st } }); usAdmin(el); }; });
+  $$('[data-ban]', el).forEach((b) => { b.onclick = async () => {
+    const ban = b.dataset.banned !== '1';
+    if (ban && !confirm('Suspender essa conta? A pessoa é desconectada e não consegue mais entrar.')) return;
+    try { await api(`/api/admin/users/${b.dataset.ban}/ban`, { method: 'POST', body: { banned: ban } }); usAdmin(el); } catch (e) { toast(e.message, true); }
+  }; });
+}
+
 async function usCall(el, cleanup) {
   const cs = callSettings();
   el.innerHTML = `<h3>Voz e vídeo</h3><div class="spinner"></div>`;
@@ -2013,18 +2381,6 @@ async function usCall(el, cleanup) {
     } catch { toast('Não consegui acessar a câmera.', true); }
   };
 }
-function usAccount(el) {
-  el.innerHTML = `<h3>Conta</h3>
-    <form id="pw"><div class="field"><label>Senha atual</label><input class="input" type="password" name="current" autocomplete="current-password"></div>
-    <div class="field"><label>Nova senha</label><input class="input" type="password" name="next" autocomplete="new-password"></div>
-    <div class="error-text" id="pw-err"></div><button class="btn primary">Alterar senha</button></form>`;
-  $('#pw', el).onsubmit = async (e) => {
-    e.preventDefault(); $('#pw-err', el).textContent = '';
-    try { await api('/api/me/password', { method: 'POST', body: Object.fromEntries(new FormData(e.target)) }); e.target.reset(); toast('Senha alterada.'); }
-    catch (err) { $('#pw-err', el).textContent = err.message; }
-  };
-}
-
 // =============================================================== IA que monta o servidor
 const AI_EXAMPLES = [
   'Comunidade do meu canal de YouTube de gameplay, com lives, clipes e sorteios',
@@ -2102,6 +2458,74 @@ async function aiBuildDialog(opts = {}) {
       }
     } catch (err) { $('#ai-err2', m).textContent = err.message; btn.disabled = false; }
   };
+}
+
+// =============================================================== chamadas na conversa privada
+function startDmCall(video) {
+  if (!S.dmId) return;
+  const key = `dm:${S.dmId}`;
+  if (call?.channelId === key) { if (video && !call.camTrack) toggleCamera(); return; }
+  joinCall(key, { video });
+}
+function fillDmCallSlot() {
+  const slot = $('#dm-call-slot'); if (!slot) return;
+  const d = S.dms.find((x) => x.id === S.dmId); if (!d) { slot.innerHTML = ''; return; }
+  const key = `dm:${d.id}`;
+  const parts = S.voice[key] || [];
+  if (call?.channelId === key) {
+    slot.innerHTML = `<div class="call dm-call" id="call-root"><div class="call-grid" id="call-grid"></div><div class="call-alone" id="call-alone"></div><div class="call-controls" id="call-controls"></div></div>`;
+    call.gridKey = null;
+    updateCallGrid(); renderControls();
+    if (parts.length <= 1) $('#call-alone').textContent = `Chamando ${d.user.display_name}…`;
+    return;
+  }
+  slot.innerHTML = parts.length ? `<div class="dm-call-banner">${icon('phone')}<span><b>Chamada em andamento</b> com ${esc(parts.map((p) => p.display_name).join(', '))}</span>
+    <button class="btn primary" id="dm-join">Entrar</button></div>` : '';
+  $('#dm-join', slot)?.addEventListener('click', () => joinCall(key));
+}
+
+// toque de chamada recebida
+let ring = null;
+function ringTone() {
+  try {
+    const ctx = audioCtx || (audioCtx = new (window.AudioContext || window.webkitAudioContext)());
+    ctx.resume?.();
+    const beep = () => {
+      [0, 0.25].forEach((t) => {
+        const o = ctx.createOscillator(), g = ctx.createGain();
+        o.frequency.value = 660 + t * 400; o.type = 'sine';
+        g.gain.setValueAtTime(0.0001, ctx.currentTime + t); g.gain.exponentialRampToValueAtTime(0.18, ctx.currentTime + t + 0.02);
+        g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + t + 0.22);
+        o.connect(g).connect(ctx.destination); o.start(ctx.currentTime + t); o.stop(ctx.currentTime + t + 0.25);
+      });
+    };
+    beep();
+    return setInterval(beep, 1800);
+  } catch { return null; }
+}
+function showRing(dmId, from, video) {
+  if (call?.dm === dmId) return;
+  stopRing();
+  const el = document.createElement('div');
+  el.className = 'ring';
+  el.innerHTML = `<div class="ring-card">${avatarHtml(from, 'lg')}<b>${esc(from.display_name)}</b><span>${video ? 'Chamada de vídeo' : 'Chamada de voz'}…</span>
+    <div class="ring-btns"><button class="ring-no" title="Recusar">${icon('phoneOff')}</button><button class="ring-yes" title="Atender">${icon(video ? 'video' : 'phone')}</button></div></div>`;
+  document.body.appendChild(el);
+  ring = { dmId, el, timer: ringTone(), stop: setTimeout(() => stopRing(dmId), 45000) };
+  try { if (document.visibilityState !== 'visible' && Notification?.permission === 'granted') new Notification(`${from.display_name} está te ligando`, { body: 'Abra o Lumix para atender.' }); } catch { /* ignora */ }
+  $('.ring-no', el).onclick = () => { socket.emit('call:decline', { dm_id: dmId }); stopRing(dmId); };
+  $('.ring-yes', el).onclick = async () => {
+    stopRing(dmId);
+    if (!S.dms.some((d) => d.id === dmId)) { try { S.dms = await api('/api/dms'); } catch { /* ignora */ } }
+    navigate(`/dm/${dmId}`);
+    joinCall(`dm:${dmId}`, { video });
+  };
+}
+function stopRing(dmId) {
+  if (!ring || (dmId && ring.dmId !== dmId)) return;
+  clearInterval(ring.timer); clearTimeout(ring.stop);
+  ring.el.remove();
+  ring = null;
 }
 
 // =============================================================== teclas de atalho
@@ -2185,7 +2609,7 @@ const ACTIONS = {
     const parts = S.voice[call.channelId] || [];
     const sharer = parts.find((p) => p.screen && p.socket_id !== socket.id) || parts.find((p) => p.screen);
     const k = sharer ? sharer.socket_id + ':s' : $('#call-grid .tile')?.dataset.key;
-    if (S.channelId !== call.channelId) navigate(`/s/${call.serverId}/${call.channelId}`);
+    if (!callVisible()) navigate(callPath());
     if (k) setTimeout(() => enterFocus(k), 50);
   },
   prevChannel: () => stepChannel(-1),
@@ -2242,9 +2666,10 @@ function shortcutsHelp() {
       <div class="key-row"><span>Fechar janelas / sair da tela cheia</span><span><kbd>Esc</kbd></span></div>
       <div class="key-row"><span>Enviar mensagem · nova linha</span><span><kbd>Enter</kbd> · <kbd>Shift</kbd><span class="plus">+</span><kbd>Enter</kbd></span></div>
     </div>
-    <div class="foot"><button class="btn" id="kh-edit">Mudar atalhos</button><button class="btn primary" id="kh-ok">Fechar</button></div>`);
+    <div class="foot"><button class="btn ghost" id="kh-bug">${icon('flag')}Relatar problema</button><button class="btn" id="kh-edit">Mudar atalhos</button><button class="btn primary" id="kh-ok">Fechar</button></div>`);
   $('#kh-ok', m).onclick = closeModal;
   $('#kh-edit', m).onclick = () => userSettings('keys');
+  $('#kh-bug', m).onclick = () => userSettings('report');
 }
 
 function quickSwitcher() {
