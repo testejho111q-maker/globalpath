@@ -1,4 +1,4 @@
-// GlobalPath — servidor completo (Express + Socket.IO + banco em arquivo JSON)
+// Lumix — servidor completo (Express + Socket.IO + banco em arquivo JSON)
 const path = require('path');
 const fs = require('fs');
 const http = require('http');
@@ -270,7 +270,7 @@ function applyPlan(s, ownerId, rawPlan, { replace = false } = {}) {
 const applyTemplate = (s, ownerId) => applyPlan(s, ownerId, STREAMER_PLAN);
 
 // ---------------------------------------------------------------- IA que monta o servidor
-const AI_SYSTEM = `Você monta a estrutura de servidores de comunidade (estilo Discord) para o app GlobalPath.
+const AI_SYSTEM = `Você monta a estrutura de servidores de comunidade (estilo Discord) para o app Lumix.
 Responda SOMENTE com um JSON válido, sem texto antes ou depois, neste formato:
 {"roles":[{"name":"👑 Dono","color":"#ef4444","hoist":true,"perms":{"admin":true},"owner":true}],
  "categories":[{"name":"📌 Informações","private":false,"channels":[{"name":"📜regras","kind":"text","read_only":true,"topic":"Leia antes de participar."}]}],
@@ -1203,5 +1203,5 @@ io.on('connection', (sock) => {
   }
   migrate();
   if (store) store.saveDb(() => JSON.stringify(db), 0);
-  server.listen(PORT, () => console.log(`GlobalPath rodando em http://localhost:${PORT}`));
+  server.listen(PORT, () => console.log(`Lumix rodando em http://localhost:${PORT}`));
 })();

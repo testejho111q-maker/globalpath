@@ -1,7 +1,7 @@
 {
   "name": "globalpath",
   "version": "1.0.0",
-  "description": "GlobalPath - servidores, chat e chamadas de voz/vídeo",
+  "description": "Lumix - servidores, chat e chamadas de voz/vídeo",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"

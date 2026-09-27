@@ -1,4 +1,4 @@
-# GlobalPath — versão independente (sem Base44)
+# Lumix — versão independente (sem Base44)
 
 App estilo Discord: servidores, canais de texto e de voz, chat em tempo real, chamadas com microfone, câmera e compartilhamento de tela, perfil com foto, convites por link, membros e configurações.
 
