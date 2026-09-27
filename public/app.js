@@ -38,6 +38,10 @@ const ICONS = {
   users: '<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.9M16 3.1a4 4 0 0 1 0 7.8"/>',
   userPlus: '<path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="8.5" cy="7" r="4"/><path d="M20 8v6M23 11h-6"/>',
   menu: '<path d="M3 12h18M3 6h18M3 18h18"/>',
+  file: '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/>',
+  download: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/>',
+  paperclip: '<path d="m21.4 11.1-9.2 9.2a6 6 0 0 1-8.5-8.5l9.2-9.2a4 4 0 0 1 5.7 5.7l-9.2 9.2a2 2 0 0 1-2.8-2.8l8.5-8.5"/>',
+  image: '<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="m21 15-5-5L5 21"/>',
   chat: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
   compass: '<circle cx="12" cy="12" r="10"/><path d="m16.2 7.8-2.1 6.3-6.3 2.1 2.1-6.3z"/>',
   edit: '<path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/>',
@@ -528,41 +532,180 @@ const threadId = () => (S.serverId ? S.channelId : S.dmId);
 function threadFor() {
   if (!S.serverId) {
     const d = S.dms.find((x) => x.id === S.dmId); if (!d) return null;
-    return { id: d.id, dm: d, base: `/api/dms/${d.id}/messages`, canPost: true, placeholder: `Conversar com @${d.user.display_name}`,
+    return { id: d.id, dm: d, base: `/api/dms/${d.id}/messages`, canPost: true, attach: { images: true, files: true, audio: true }, placeholder: `Conversar com @${d.user.display_name}`,
       canDel: (m) => m.author_id === S.me.id, delUrl: (x) => `/api/dm-messages/${x}`,
       welcome: `<div class="welcome">${avatarHtml(d.user, 'lg')}<h2 style="margin-top:12px">${esc(d.user.display_name)}</h2><p>Este é o começo da sua conversa com <b>${esc(d.user.display_name)}</b>.</p></div>` };
   }
   const c = chan(); if (!c || c.kind !== 'text') return null;
-  return { id: c.id, chan: c, base: `/api/channels/${c.id}/messages`, canPost: c.can_post, placeholder: `Conversar em #${c.name}`,
+  const attach = c.can_attach || { images: true, files: true, audio: true };
+  const textOnly = !attach.images && !attach.files && !attach.audio;
+  return { id: c.id, chan: c, base: `/api/channels/${c.id}/messages`, canPost: c.can_post, attach, placeholder: `Conversar em #${c.name}${textOnly ? ' (só texto)' : ''}`,
     canDel: (m) => m.author_id === S.me.id || !!current()?.perms?.manage_messages, delUrl: (x) => `/api/messages/${x}`,
     welcome: `<div class="welcome"><div class="big">${icon('hash')}</div><h2>Bem-vindo a #${esc(c.name)}!</h2><p>${c.topic ? esc(c.topic) : `Este é o começo do canal #${esc(c.name)}.`}</p></div>` };
 }
 function renderThread(el) {
   const t = threadFor(); if (!t) return;
+  const canFiles = t.attach.images || t.attach.files || t.attach.audio;
+  const canVoice = t.attach.audio && !!window.MediaRecorder && !!navigator.mediaDevices?.getUserMedia;
   el.innerHTML = `<div class="main-head"></div>
     <div class="messages" id="messages"></div>
-    ${t.canPost ? `<form class="composer" id="composer"><div class="composer-box">
-      <textarea id="msg-input" rows="1" maxlength="2000" placeholder="${esc(t.placeholder)}"></textarea>
-      <button class="send" type="submit" disabled title="Enviar">${icon('send')}</button></div></form>`
+    ${t.canPost ? `<form class="composer" id="composer">
+      <div class="pending hidden" id="pending"></div>
+      <div class="composer-box" id="composer-box">
+        ${canFiles ? `<button type="button" class="attach" id="attach-btn" title="Enviar ${[t.attach.images && 'imagem', t.attach.files && 'arquivo', t.attach.audio && 'áudio'].filter(Boolean).join(', ')}">${icon('plus')}</button>` : ''}
+        <textarea id="msg-input" rows="1" maxlength="2000" placeholder="${esc(t.placeholder)}"></textarea>
+        ${canVoice ? `<button type="button" class="attach" id="rec-btn" title="Gravar mensagem de voz">${icon('mic')}</button>` : ''}
+        <button class="send" type="submit" disabled title="Enviar">${icon('send')}</button>
+      </div>
+      <div class="rec-bar hidden" id="rec-bar"><span class="rec-dot"></span><span id="rec-time">0:00</span><span class="hint">Gravando áudio…</span><span class="spacer"></span>
+        <button type="button" class="btn ghost" id="rec-cancel">Cancelar</button><button type="button" class="btn primary" id="rec-send">${icon('send')}Enviar</button></div>
+      <input type="file" id="file-input" multiple class="hidden" accept="${[t.attach.images && 'image/*', t.attach.audio && 'audio/*', t.attach.files && '*/*'].filter(Boolean).join(',')}">
+    </form>`
     : `<div class="composer"><div class="composer-box readonly">${icon('lock')}Você não tem permissão para enviar mensagens neste canal.</div></div>`}`;
   renderHead();
+  const box = $('#messages');
+  box._stick = true;
+  box.addEventListener('scroll', () => { box._stick = box.scrollHeight - box.scrollTop - box.clientHeight < 120; });
+  box.addEventListener('load', (e) => { if (/IMG|VIDEO/.test(e.target.tagName) && box._stick) box.scrollTop = box.scrollHeight; }, true);
   loadMessages(t);
   if (!t.canPost) return;
   const ta = $('#msg-input');
   const sendBtn = $('#composer .send');
-  const grow = () => { ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 180) + 'px'; sendBtn.disabled = !ta.value.trim(); };
-  ta.oninput = grow;
-  ta.onkeydown = (e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); $('#composer').requestSubmit(); } };
-  $('#composer').onsubmit = async (e) => {
-    e.preventDefault();
-    const content = ta.value.trim(); if (!content) return;
-    ta.value = ''; grow();
-    try {
-      const m = await api(t.base, { method: 'POST', body: { content } });
-      addMessage(t.id, m);
-    } catch (err) { toast(err.message, true); ta.value = content; grow(); }
+  const pending = [];
+  const busy = () => pending.some((p) => !p.att && !p.error);
+  const grow = () => {
+    ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 180) + 'px';
+    sendBtn.disabled = busy() || (!ta.value.trim() && !pending.some((p) => p.att));
   };
+  const drawPending = () => {
+    const tray = $('#pending');
+    tray.classList.toggle('hidden', !pending.length);
+    tray.innerHTML = pending.map((p, i) => `
+      <div class="pend ${p.error ? 'err' : ''}">
+        ${p.preview ? `<img src="${p.preview}" alt="">` : `<span class="pend-ico">${icon(p.kind === 'audio' ? 'mic' : 'file')}</span>`}
+        <span class="pend-name">${esc(p.name)}<small>${p.error ? esc(p.error) : p.att ? fmtSize(p.size) : `Enviando… ${Math.round(p.progress * 100)}%`}</small></span>
+        <button type="button" class="icon-btn" data-rm="${i}" title="Remover">${icon('x')}</button>
+        ${!p.att && !p.error ? `<i class="pend-bar" style="width:${Math.round(p.progress * 100)}%"></i>` : ''}
+      </div>`).join('');
+    $$('[data-rm]', tray).forEach((b) => { b.onclick = () => { const p = pending.splice(+b.dataset.rm, 1)[0]; if (p?.preview) URL.revokeObjectURL(p.preview); drawPending(); grow(); }; });
+    grow();
+  };
+  const addFiles = (files) => {
+    for (const file of files) {
+      if (pending.length >= 10) { toast('No máximo 10 anexos por mensagem.', true); break; }
+      const kind = fileKind(file.type);
+      const key = kind === 'image' ? 'images' : kind === 'audio' ? 'audio' : 'files';
+      if (!t.attach[key]) { toast({ images: 'Este canal não aceita imagens.', audio: 'Este canal não aceita áudios.', files: 'Este canal não aceita arquivos.' }[key], true); continue; }
+      if (file.size > MAX_FILE) { toast(`"${file.name}" passa de ${MAX_FILE / 1048576} MB.`, true); continue; }
+      const p = { name: file.name || 'arquivo', size: file.size, kind, progress: 0, preview: kind === 'image' ? URL.createObjectURL(file) : '' };
+      pending.push(p);
+      uploadFile(file, (x) => { p.progress = x; drawPending(); })
+        .then((att) => { p.att = att; drawPending(); })
+        .catch((err) => { p.error = err.message; drawPending(); });
+    }
+    drawPending();
+  };
+  const send = async (extraIds = []) => {
+    const content = ta.value.trim();
+    const ids = [...pending.filter((p) => p.att).map((p) => p.att.id), ...extraIds];
+    if (!content && !ids.length) return;
+    ta.value = '';
+    const old = pending.splice(0);
+    drawPending();
+    try {
+      const m = await api(t.base, { method: 'POST', body: { content, attachments: ids } });
+      old.forEach((p) => p.preview && URL.revokeObjectURL(p.preview));
+      addMessage(t.id, m);
+    } catch (err) { toast(err.message, true); ta.value = content; pending.push(...old.filter((p) => !extraIds.includes(p.att?.id))); drawPending(); }
+  };
+  ta.oninput = grow;
+  ta.onkeydown = (e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); if (!sendBtn.disabled) $('#composer').requestSubmit(); } };
+  ta.onpaste = (e) => { const files = [...(e.clipboardData?.files || [])]; if (files.length) { e.preventDefault(); addFiles(files); } };
+  $('#composer').onsubmit = (e) => { e.preventDefault(); if (!busy()) send(); };
+  $('#attach-btn')?.addEventListener('click', () => $('#file-input').click());
+  $('#file-input').onchange = (e) => { addFiles([...e.target.files]); e.target.value = ''; };
+  // arrastar e soltar arquivos na conversa
+  if (canFiles) {
+    const main = $('#main');
+    main.ondragover = (e) => { if ([...(e.dataTransfer?.types || [])].includes('Files')) { e.preventDefault(); main.classList.add('dropping'); } };
+    main.ondragleave = (e) => { if (e.target === main || !main.contains(e.relatedTarget)) main.classList.remove('dropping'); };
+    main.ondrop = (e) => { e.preventDefault(); main.classList.remove('dropping'); addFiles([...(e.dataTransfer?.files || [])]); };
+  } else { const main = $('#main'); main.ondragover = main.ondrop = main.ondragleave = null; }
+  // mensagem de voz
+  let rec = null;
+  const recUi = (on) => { $('#composer-box').classList.toggle('hidden', on); $('#rec-bar').classList.toggle('hidden', !on); };
+  const stopRec = (keep) => new Promise((resolve) => {
+    if (!rec) return resolve(null);
+    const r = rec; rec = null;
+    clearInterval(r.timer);
+    r.mr.onstop = () => { r.stream.getTracks().forEach((x) => x.stop()); resolve(keep ? new Blob(r.chunks, { type: r.mr.mimeType || 'audio/webm' }) : null); };
+    r.mr.stop();
+    recUi(false);
+  });
+  $('#rec-btn')?.addEventListener('click', async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints() });
+      const type = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg'].find((x) => MediaRecorder.isTypeSupported?.(x)) || '';
+      const mr = new MediaRecorder(stream, type ? { mimeType: type } : undefined);
+      rec = { mr, stream, chunks: [], start: Date.now() };
+      mr.ondataavailable = (e) => e.data.size && rec?.chunks.push(e.data);
+      mr.start(250);
+      recUi(true);
+      rec.timer = setInterval(() => {
+        const sec = Math.floor((Date.now() - rec.start) / 1000);
+        $('#rec-time').textContent = `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}`;
+        if (sec >= 180) $('#rec-send').click();
+      }, 250);
+    } catch { toast('Não consegui acessar o microfone.', true); }
+  });
+  $('#rec-cancel')?.addEventListener('click', () => stopRec(false));
+  $('#rec-send')?.addEventListener('click', async (e) => {
+    const btn = e.currentTarget; btn.disabled = true;
+    const blob = await stopRec(true);
+    btn.disabled = false;
+    if (!blob || blob.size < 800) return toast('Áudio muito curto.');
+    const ext = /mp4/.test(blob.type) ? 'm4a' : /ogg/.test(blob.type) ? 'ogg' : 'webm';
+    const file = new File([blob], `audio-${new Date().toISOString().slice(11, 19).replace(/:/g, '')}.${ext}`, { type: blob.type.split(';')[0] });
+    try { const att = await uploadFile(file, () => {}); await send([att.id]); } catch (err) { toast(err.message, true); }
+  });
   if (window.innerWidth > 800) ta.focus();
+}
+const MAX_FILE = 8 * 1048576;
+function fileKind(type = '') {
+  if (/^image\/(png|jpe?g|gif|webp)$/.test(type)) return 'image';
+  if (/^audio\//.test(type)) return 'audio';
+  if (/^video\/(mp4|webm|quicktime)$/.test(type)) return 'video';
+  return 'file';
+}
+function fmtSize(n = 0) {
+  if (n < 1024) return `${n} B`;
+  if (n < 1048576) return `${(n / 1024).toFixed(0)} KB`;
+  return `${(n / 1048576).toFixed(1).replace('.', ',')} MB`;
+}
+function uploadFile(file, onProgress) {
+  return new Promise((resolve, reject) => {
+    const x = new XMLHttpRequest();
+    x.open('POST', '/api/upload');
+    x.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
+    x.setRequestHeader('X-Filename', encodeURIComponent(file.name || 'arquivo'));
+    x.upload.onprogress = (e) => { if (e.lengthComputable) onProgress(e.loaded / e.total); };
+    x.onload = () => {
+      let d = null; try { d = JSON.parse(x.responseText); } catch { /* sem json */ }
+      if (x.status < 300 && d) resolve(d); else reject(new Error(d?.error || 'Falha ao enviar o arquivo.'));
+    };
+    x.onerror = () => reject(new Error('Falha na conexão ao enviar o arquivo.'));
+    x.send(file);
+  });
+}
+function attachmentsHtml(list) {
+  if (!list?.length) return '';
+  return `<div class="atts">${list.map((a) => {
+    const url = esc(a.url);
+    if (a.kind === 'image') return `<button type="button" class="att-img" data-lightbox="${url}"><img src="${url}" alt="${esc(a.name)}" loading="lazy"></button>`;
+    if (a.kind === 'audio') return `<div class="att-audio">${icon('mic')}<audio controls preload="metadata" src="${url}"></audio></div>`;
+    if (a.kind === 'video') return `<video class="att-video" controls preload="metadata" src="${url}"></video>`;
+    return `<a class="att-file" href="${url}" download="${esc(a.name)}">${icon('file')}<span><b>${esc(a.name)}</b><small>${fmtSize(a.size)}</small></span>${icon('download')}</a>`;
+  }).join('')}</div>`;
 }
 function addMessage(tid, m) {
   const list = S.messages[tid];
@@ -596,7 +739,7 @@ function messageHtml(m, prev, t) {
   return `${day}<div class="msg ${head ? 'head' : ''}" data-mid="${m.id}">
     <div class="gutter">${head ? avatarHtml(user) : `<time>${fmtTime(m.created_at)}</time>`}</div>
     <div class="body">${head ? `<div class="meta"><b style="color:${safeColor(m.author_color) || 'inherit'}">${esc(m.author_name)}</b><time>${fmtDay(m.created_at)} às ${fmtTime(m.created_at)}</time></div>` : ''}
-      <div class="text">${linkify(m.content)}</div></div>
+      ${m.content ? `<div class="text">${linkify(m.content)}</div>` : ''}${attachmentsHtml(m.attachments)}</div>
     ${canDel ? `<div class="actions"><button class="icon-btn" data-del="${m.id}" title="Excluir mensagem">${icon('trash')}</button></div>` : ''}
   </div>`;
 }
@@ -623,6 +766,13 @@ function appendMessage(m) {
   if (nearBottom) box.scrollTop = box.scrollHeight;
 }
 function bindMessageActions(box) {
+  $$('[data-lightbox]', box).forEach((b) => {
+    b.onclick = () => {
+      const m = openModal(`<img class="lightbox" src="${esc(b.dataset.lightbox)}" alt=""><div class="foot"><a class="btn" href="${esc(b.dataset.lightbox)}" target="_blank" rel="noopener">${icon('download')}Abrir original</a><button class="btn primary" id="lb-close">Fechar</button></div>`);
+      m.classList.add('lb-modal');
+      $('#lb-close', m).onclick = closeModal;
+    };
+  });
   $$('[data-del]', box).forEach((b) => {
     b.onclick = async () => {
       const t = threadFor(); if (!t) return;
@@ -1214,12 +1364,13 @@ function createChannelDialog(kind = 'text', categoryId) {
         <button type="button" class="kind-opt" data-k="voice">${icon('volume')}<span><b>Voz</b><small>Voz, vídeo e compartilhamento de tela</small></span></button></div>
       <div class="field"><label>Nome do canal</label><input class="input" name="name" maxlength="40" placeholder="novo-canal"></div>
       <div class="field"><label>Categoria</label><select class="input" name="category_id">${categoryOptions(categoryId)}</select></div>
+      <div class="switch" id="cc-textonly"><span>Só texto <small class="hint" style="display:block">Bloqueia imagens, arquivos e áudios (dá para mudar depois).</small></span><input type="checkbox" name="text_only"></div>
       <div class="switch"><span>Canal privado <small class="hint" style="display:block">Só os cargos escolhidos veem o canal.</small></span><input type="checkbox" name="private"></div>
       <div id="cc-roles" class="hidden" style="padding-top:10px">${roleChecks()}</div>
       <div class="error-text" id="cc-err" style="margin-top:12px"></div>
       <div class="foot"><button type="button" class="btn ghost" id="cc-cancel">Cancelar</button><button class="btn primary">Criar canal</button></div>
     </form>`);
-  const sel = () => $$('[data-k]', m).forEach((b) => b.classList.toggle('sel', b.dataset.k === k));
+  const sel = () => { $$('[data-k]', m).forEach((b) => b.classList.toggle('sel', b.dataset.k === k)); $('#cc-textonly', m).classList.toggle('hidden', k !== 'text'); };
   sel();
   $$('[data-k]', m).forEach((b) => { b.onclick = () => { k = b.dataset.k; sel(); }; });
   $('[name=private]', m).onchange = (e) => $('#cc-roles', m).classList.toggle('hidden', !e.target.checked);
@@ -1229,7 +1380,7 @@ function createChannelDialog(kind = 'text', categoryId) {
     const f = e.target;
     const allowed = f.private.checked ? $$('[name=role]:checked', m).map((x) => x.value) : [];
     try {
-      const c = await api(`/api/servers/${S.serverId}/channels`, { method: 'POST', body: { name: f.name.value, kind: k, category_id: f.category_id.value, allowed_roles: allowed } });
+      const c = await api(`/api/servers/${S.serverId}/channels`, { method: 'POST', body: { name: f.name.value, kind: k, category_id: f.category_id.value, allowed_roles: allowed, ...(k === 'text' && f.text_only.checked ? { allow: { images: false, files: false, audio: false } } : {}) } });
       const l = S.channels[S.serverId]; if (!l.some((x) => x.id === c.id)) l.push(c);
       closeModal();
       navigate(`/s/${S.serverId}/${c.id}`);
@@ -1247,6 +1398,12 @@ function channelSettingsDialog(cid) {
       ${c.kind === 'text' ? `<div class="field"><label>Tópico</label><input class="input" name="topic" maxlength="200" value="${esc(c.topic || '')}" placeholder="Sobre o que é este canal?"></div>` : ''}
       <div class="field"><label>Categoria</label><select class="input" name="category_id">${categoryOptions(c.category_id)}</select></div>
       <div class="switch"><span>${c.kind === 'voice' ? 'Só a Staff fala' : 'Só leitura'} <small class="hint" style="display:block">${c.kind === 'voice' ? 'Os outros entram só para ouvir e assistir.' : 'Só quem pode gerenciar mensagens escreve aqui.'}</small></span><input type="checkbox" name="read_only" ${c.read_only ? 'checked' : ''}></div>
+      ${c.kind === 'text' ? `<h4 class="perm-title">O que pode ser enviado aqui</h4>
+      <div class="switch"><span>${icon('image')} Imagens</span><input type="checkbox" name="allow_images" ${c.allow?.images === false ? '' : 'checked'}></div>
+      <div class="switch"><span>${icon('file')} Arquivos e vídeos</span><input type="checkbox" name="allow_files" ${c.allow?.files === false ? '' : 'checked'}></div>
+      <div class="switch"><span>${icon('mic')} Áudios e mensagens de voz</span><input type="checkbox" name="allow_audio" ${c.allow?.audio === false ? '' : 'checked'}></div>
+      <p class="hint" style="margin:6px 0 10px">Desligue os três para deixar o canal <b>só texto</b>. A Staff (quem gerencia mensagens) sempre pode enviar.</p>
+      <h4 class="perm-title">Acesso</h4>` : ''}
       <div class="switch"><span>Canal privado <small class="hint" style="display:block">Só os cargos escolhidos veem o canal.</small></span><input type="checkbox" name="private" ${priv ? 'checked' : ''}></div>
       <div id="ec-roles" class="${priv ? '' : 'hidden'}" style="padding-top:10px">${roleChecks(c.allowed_roles || [])}</div>
       <div style="display:flex;gap:8px;margin-top:14px"><button type="button" class="btn ghost" data-move="-1">↑ Subir</button><button type="button" class="btn ghost" data-move="1">↓ Descer</button></div>
@@ -1267,6 +1424,7 @@ function channelSettingsDialog(cid) {
     const body = { name: f.name.value, category_id: f.category_id.value, read_only: f.read_only.checked,
       allowed_roles: f.private.checked ? $$('[name=role]:checked', m).map((x) => x.value) : [] };
     if (f.topic) body.topic = f.topic.value;
+    if (f.allow_images) body.allow = { images: f.allow_images.checked, files: f.allow_files.checked, audio: f.allow_audio.checked };
     if (f.private.checked && !body.allowed_roles.length) { $('#ec-err', m).textContent = 'Escolha pelo menos um cargo para o canal privado.'; return; }
     try { await api(`/api/channels/${c.id}`, { method: 'PATCH', body }); closeModal(); toast('Canal salvo.'); } catch (err) { $('#ec-err', m).textContent = err.message; }
   };
