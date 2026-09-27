@@ -290,3 +290,14 @@ svg.i { width: 18px; height: 18px; flex: none; stroke: currentColor; fill: none;
   .color-grid { grid-template-columns: repeat(5, 1fr); }
 }
 @media (min-width: 801px) { .nav-wrap { display: flex; } .nav-scrim { display: none; } }
+
+/* ---------- tela cheia / foco */
+.call:fullscreen { background: #000; }
+.call-grid.focus { padding: 0; display: flex !important; align-items: stretch; justify-content: center; max-width: none !important; }
+.call-grid.focus .tile { flex: 1; aspect-ratio: auto; border-radius: 0; border: 0; height: 100%; }
+.call:fullscreen .call-controls { position: absolute; left: 0; right: 0; bottom: 0; background: linear-gradient(transparent, rgba(0,0,0,.7)); opacity: 0; transition: opacity .2s; }
+.call:fullscreen:hover .call-controls { opacity: 1; }
+.call:fullscreen .call-alone { display: none; }
+.call { position: relative; }
+.tile .fs { opacity: .85; }
+.call:fullscreen .tile .label { top: 12px; left: 12px; bottom: auto; }
